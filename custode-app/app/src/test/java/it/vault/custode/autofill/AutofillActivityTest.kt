@@ -45,7 +45,7 @@ class AutofillActivityTest {
             .putExtra(AutofillActivity.EXTRA_WEB, "banca.esempio.it")
             .putExtra(AutofillActivity.EXTRA_LABEL, "banca.esempio.it")
 
-        val scenario = ActivityScenario.launch<AutofillActivity>(intent)
+        val scenario = ActivityScenario.launchActivityForResult<AutofillActivity>(intent)
         rule.onNodeWithText("Sblocca Custode").assertIsDisplayed()          // database bloccato: prima l'autenticazione
         rule.onNodeWithTag("pw").performTextInput("pw-autofill-1")
         rule.onNodeWithTag("submit").performClick()
@@ -75,7 +75,7 @@ class AutofillActivityTest {
             .putExtra(AutofillActivity.EXTRA_LABEL, "nuovo-sito.it")
             .putExtra(AutofillActivity.EXTRA_USER, "luca")
             .putExtra(AutofillActivity.EXTRA_PASSWORD, "P4ss-nuova!")
-        val scenario = ActivityScenario.launch<AutofillActivity>(intent)
+        val scenario = ActivityScenario.launchActivityForResult<AutofillActivity>(intent)
         rule.onNodeWithTag("pw").performTextInput("pw-autofill-2")
         rule.onNodeWithTag("submit").performClick()
         wait { rule.onAllNodesWithTag("save").fetchSemanticsNodes().isNotEmpty() }
