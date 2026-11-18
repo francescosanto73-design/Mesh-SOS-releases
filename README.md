@@ -20,3 +20,11 @@ Attenzione: se dimentichi la password principale i dati non sono recuperabili.
 La cartella [`custode-kdx/`](custode-kdx/) contiene una versione di **KeePassDX 4.5.8** con nome e icona propri,
 compilata da GitHub Actions ("Build Custode") a partire dal codice sorgente. Licenza GPL-3, vedi `custode-kdx/NOTICE.md`.
 Formato database: KeePass (KDBX), compatibile con KeePassXC, KeePassDX e altri.
+
+## Custode 1.1 (app Android, `custode-app/` + nucleo `custode-core/`)
+Gestore di password offline (nessun permesso internet) con database KDBX 4 compatibile con KeePass/KeePassXC/KeePassDX.
+Novità 1.1: compilazione automatica, codici TOTP, cestino, storico delle modifiche, allegati, campi personalizzati,
+spostamento tra gruppi, impostazioni di blocco e appunti.
+Test: `custode-core/tests/*.py` (contro KeePassXC e pykeepass), test JVM del nucleo, test Robolectric dell'app (18).
+L'APK si firma in locale con una chiave che NON sta nel repository (variabili CUSTODE_KEYSTORE, CUSTODE_KS_PASS).
+Non incluso: passkey, file KDB 1.x, scrittura KDBX 3, TOTP Steam.
