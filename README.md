@@ -1,2 +1,15 @@
-# Mesh-SOS-releases
-Aggiornamento MESH SOS
+# Custode Password
+
+App Android (Kotlin + Jetpack Compose) per custodire le password in locale, cifrate.
+
+- Cifratura: PBKDF2-HMAC-SHA256 (210k iterazioni) + AES-256-GCM, un solo file `vault.bin` nella memoria privata dell'app
+- Nessun permesso, nessuna rete, backup Android disattivato
+- Blocco automatico in background, FLAG_SECURE, appunti sensibili cancellati dopo 30 s
+- Generatore di password, ricerca, modifica ed eliminazione
+
+## Ottenere l'APK
+Su GitHub: **Actions → Build APK → ultima esecuzione → Artifacts → CustodePassword-debug**,
+poi copia `app-debug.apk` sul telefono e installalo (consenti "origini sconosciute").
+In alternativa apri la cartella in Android Studio e premi Run.
+
+Attenzione: se dimentichi la password principale i dati non sono recuperabili.
