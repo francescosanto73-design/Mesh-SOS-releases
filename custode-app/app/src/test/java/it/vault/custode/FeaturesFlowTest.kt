@@ -28,7 +28,8 @@ class FeaturesFlowTest {
         e.setField("otp", "otpauth://totp/Banca:mario?secret=JBSWY3DPEHPK3PXP&period=30&digits=6", protect = true)
         store.save()                                            // resta sbloccato: l'app lo riprende
 
-        ActivityScenario.launch(MainActivity::class.java)
+        val scenario = ActivityScenario.launch(MainActivity::class.java)
+        try {
         waitText("Banca")
         rule.onNodeWithText("Banca").performClick()
         waitTag("totp")
@@ -53,5 +54,9 @@ class FeaturesFlowTest {
         // il file su disco riflette tutto
         store.lock(); store.open("pw-features-1".toCharArray(), null)
         assertEquals("Banca", store.db!!.activeEntries().single().title)
+        } finally {
+            scenario.close()    // ferma il contatore del codice TOTP: non deve restare attivo per i test successivi
+            store.lock()
+        }
     }
 }
