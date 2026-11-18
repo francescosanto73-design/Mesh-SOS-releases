@@ -25,7 +25,24 @@ import org.robolectric.annotation.Config
 class AutofillActivityTest {
     @get:Rule val rule = createEmptyComposeRule()
 
-    private fun wait(cond: () -> Boolean) = rule.waitUntil(60_000, cond)
+    /**
+     * Attende senza lasciare che il clock di Compose giri da solo: un'animazione infinita (indicatore di attesa,
+     * cursore lampeggiante) impedirebbe a Compose di risultare "inattivo". Qui il tempo avanza a mano.
+     */
+    private fun wait(cond: () -> Boolean) {
+        rule.mainClock.autoAdvance = false
+        val end = System.currentTimeMillis() + 60_000
+        while (true) {
+            rule.mainClock.advanceTimeByFrame()
+            if (cond()) return
+            if (System.currentTimeMillis() > end) {
+                println(rule.onRoot(useUnmergedTree = true).printToString(100))
+                fail("Condizione non raggiunta in 60 s (albero della schermata stampato sopra)")
+            }
+            Thread.sleep(30)
+        }
+    }
+    private fun settle() { rule.mainClock.autoAdvance = false; repeat(4) { rule.mainClock.advanceTimeByFrame() } }
 
     @Test fun fillFlowReturnsOnlyTheChosenEntryAndLocksAgain() {
         val ctx = ApplicationProvider.getApplicationContext<Context>()
@@ -48,10 +65,10 @@ class AutofillActivityTest {
         val scenario = ActivityScenario.launchActivityForResult<AutofillActivity>(intent)
         rule.onNodeWithText("Sblocca Custode").assertIsDisplayed()          // database bloccato: prima l'autenticazione
         rule.onNodeWithTag("pw").performTextInput("pw-autofill-1")
-        rule.onNodeWithTag("submit").performClick()
+        rule.onNodeWithTag("submit").performClick(); settle()
         wait { rule.onAllNodesWithTag("choose").fetchSemanticsNodes().isNotEmpty() }
         rule.onNodeWithText("Corrispondenti").assertIsDisplayed()          // la voce giusta è proposta per prima
-        rule.onNodeWithTag("row-Banca").performClick()
+        rule.onNodeWithTag("row-Banca").performClick(); settle()
 
         val result = scenario.result
         assertEquals(Activity.RESULT_OK, result.resultCode)
@@ -77,9 +94,9 @@ class AutofillActivityTest {
             .putExtra(AutofillActivity.EXTRA_PASSWORD, "P4ss-nuova!")
         val scenario = ActivityScenario.launchActivityForResult<AutofillActivity>(intent)
         rule.onNodeWithTag("pw").performTextInput("pw-autofill-2")
-        rule.onNodeWithTag("submit").performClick()
+        rule.onNodeWithTag("submit").performClick(); settle()
         wait { rule.onAllNodesWithTag("save").fetchSemanticsNodes().isNotEmpty() }
-        rule.onNodeWithTag("save").performClick()
+        rule.onNodeWithTag("save").performClick(); settle()
         assertEquals(Activity.RESULT_OK, scenario.result.resultCode)
         store.open("pw-autofill-2".toCharArray(), null)
         val e = store.db!!.allEntries().single()
