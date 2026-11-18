@@ -51,6 +51,35 @@ out = os.path.join(tmp, "esportato.bin")
 r = xc("attachment-export", f3, "GitHub", "chiave.bin", out)
 check("allegato conservato byte per byte dopo la conversione v3→v4", os.path.exists(out) and open(out, "rb").read() == open(blob, "rb").read(), r.stderr)
 
+# 4) file chiave (XML di KeePassXC, file generico, 32 byte grezzi) con e senza password
+def kcheck(label, kfile_path, make_in_xc):
+    if make_in_xc:
+        r = run(["keepassxc-cli", "db-create", "-p", "-k", kfile_path, "--decryption-time", "100", os.path.join(tmp, label + ".kdbx")], stdin=PW + "\n" + PW + "\n")
+    else:
+        r = run(["keepassxc-cli", "db-create", "-p", "-k", kfile_path, "--decryption-time", "100", os.path.join(tmp, label + ".kdbx")], stdin=PW + "\n" + PW + "\n")
+    f = os.path.join(tmp, label + ".kdbx")
+    check(f"[{label}] KeePassXC crea db con password + file chiave", r.returncode == 0 and os.path.exists(f), r.stderr[:200])
+    r = run(["keepassxc-cli", "add", "-k", kfile_path, "-u", "u1", "-p", f, "Voce"], stdin=PW + "\nsegreto-" + label + "\n")
+    check(f"[{label}] KeePassXC aggiunge una voce", r.returncode == 0, r.stderr[:200])
+    r = subprocess.run([CLI, "dump", f, PW], capture_output=True, text=True, env={**ENV, "KFILE": kfile_path})
+    check(f"[{label}] Custode apre con password + file chiave", r.returncode == 0 and "segreto-" + label in r.stdout, r.stderr[:200] + r.stdout[:200])
+    r = subprocess.run([CLI, "dump", f, PW], capture_output=True, text=True, env=ENV)
+    check(f"[{label}] senza il file chiave l'accesso è rifiutato", r.returncode == 3, str(r.returncode))
+    # Custode crea con file chiave -> KeePassXC apre
+    g = os.path.join(tmp, label + "_kt.kdbx")
+    r = subprocess.run([CLI, "create", g, PW], input="\tTest\tu\tp\t\t\n", capture_output=True, text=True, env={**ENV, "KFILE": kfile_path})
+    r2 = run(["keepassxc-cli", "ls", "-k", kfile_path, g], stdin=PW + "\n")
+    check(f"[{label}] KeePassXC apre il db creato da Custode con file chiave", r.returncode == 0 and r2.returncode == 0 and "Test" in r2.stdout, r.stderr[:200] + r2.stderr[:200])
+
+xml_key = os.path.join(tmp, "k.keyx")
+r = run(["keepassxc-cli", "db-create", "-p", "-k", xml_key, "--decryption-time", "100", os.path.join(tmp, "gen.kdbx")], stdin=PW + "\n" + PW + "\n")
+print("   generazione keyfile XML:", "ok" if os.path.exists(xml_key) else "NON creato: " + r.stderr[:150])
+if os.path.exists(xml_key):
+    print("   ", open(xml_key).read()[:120].replace("\n", " "))
+    kcheck("xml", xml_key, True)
+gen = os.path.join(tmp, "generico.bin"); open(gen, "wb").write(os.urandom(100)); kcheck("generico", gen, True)
+raw32 = os.path.join(tmp, "raw32.bin"); open(raw32, "wb").write(os.urandom(32)); kcheck("32byte", raw32, True)
+
 shutil.rmtree(tmp)
 print("\nRISULTATO:", "TUTTI I TEST PASSATI" if not fails else f"{len(fails)} FALLITI: {fails}")
 sys.exit(1 if fails else 0)

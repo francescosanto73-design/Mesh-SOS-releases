@@ -12,12 +12,15 @@ private fun unesc(s: String) = buildString {
     }
 }
 
+private fun kf(): ByteArray? = System.getenv("KFILE")?.let { File(it).readBytes() }
+private fun pw(a: String): CharArray? = a.takeIf { it != "-" }?.toCharArray()
+
 fun main(args: Array<String>) {
     try {
         when (args.getOrNull(0)) {
             // dump <file> <password>  → una riga TSV per voce: gruppo, titolo, utente, password, url, note, campi extra
             "dump" -> {
-                val db = KdbxDatabase.open(File(args[1]).readBytes(), args[2].toCharArray())
+                val db = KdbxDatabase.open(File(args[1]).readBytes(), pw(args[2]), kf())
                 fun walk(g: KdbxGroup, path: String) {
                     g.entries.forEach { e ->
                         println(listOf(path, e.title, e.username, e.password, e.url, e.notes,
@@ -29,7 +32,7 @@ fun main(args: Array<String>) {
             }
             // create <file> <password>  + stdin TSV (gruppo<TAB>titolo<TAB>utente<TAB>password<TAB>url<TAB>note)
             "create" -> {
-                val db = KdbxDatabase.create("Custode", args[2].toCharArray())
+                val db = KdbxDatabase.create("Custode", args[2].toCharArray()).also { if (kf() != null) it.changeKey(KdbxDatabase.compositeKeyOf(pw(args[2]), kf())) }
                 generateSequence(::readLine).filter { it.isNotBlank() }.forEach { line ->
                     val f = line.split("\t").map { unesc(it) }
                     var g = db.root
@@ -40,7 +43,7 @@ fun main(args: Array<String>) {
             }
             // roundtrip <in> <out> <password>: apre e risalva senza modifiche
             "roundtrip" -> {
-                val db = KdbxDatabase.open(File(args[1]).readBytes(), args[3].toCharArray())
+                val db = KdbxDatabase.open(File(args[1]).readBytes(), pw(args[3]), kf())
                 File(args[2]).writeBytes(db.toBytes())
             }
             else -> { System.err.println("uso: dump|create|roundtrip"); exitProcess(2) }

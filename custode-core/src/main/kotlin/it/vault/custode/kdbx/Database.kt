@@ -40,7 +40,19 @@ class KdbxDatabase internal constructor(
     private val innerStreamId: Int,
     /** true se il file originale era KDBX 3: al salvataggio viene convertito in KDBX 4. */
     val upgradedFromV3: Boolean = false,
+    transformedInit: ByteArray? = null,
 ) {
+    /** Risultato della KDF (Argon2): riusato per i salvataggi nella stessa sessione, così salvare è rapido. */
+    private var transformed: ByteArray? = transformedInit
+    /** Esegue in anticipo la KDF (lenta): i salvataggi successivi diventano rapidi. Chiamare fuori dal thread UI. */
+    fun prepare() { transformedKey() }
+
+    /** Elimina una voce o un gruppo da qualunque punto dell'albero (lascia traccia in DeletedObjects). */
+    fun delete(entry: KdbxEntry) { KdbxGroup(entry.el.parentNode as Element, this).remove(entry) }
+    fun delete(group: KdbxGroup) { KdbxGroup(group.el.parentNode as Element, this).remove(group) }
+
+    private fun transformedKey(): ByteArray = transformed ?: Kdf.transform(kdf, composite).also { transformed = it }
+
     private val random = SecureRandom()
 
     val root: KdbxGroup get() = KdbxGroup(doc.documentElement.child("Root")!!.child("Group")!!, this)
@@ -51,7 +63,15 @@ class KdbxDatabase internal constructor(
     /** Chiave composta (hash della password): serve allo sblocco biometrico. Va azzerata dal chiamante. */
     fun compositeKey(): ByteArray = composite.copyOf()
 
-    fun close() { composite.fill(0) }
+    fun close() { composite.fill(0); transformed?.fill(0); transformed = null }
+
+    /** Cambia la chiave principale (nuovo salt KDF; il prossimo salvataggio ricalcola Argon2). */
+    fun changeKey(newComposite: ByteArray) {
+        composite.fill(0); transformed?.fill(0); transformed = null
+        composite = newComposite.copyOf()
+        kdf.items["S"]?.let { it.value = ByteArray((it.value as ByteArray).size).also(random::nextBytes) }
+        doc.documentElement.child("Meta")?.child("MasterKeyChanged")?.textContent = nowIso()
+    }
 
     fun allEntries(): List<KdbxEntry> = root.entriesRecursive()
 
@@ -61,7 +81,6 @@ class KdbxDatabase internal constructor(
         val cipherId = headerFields[2] ?: CIPHER_AES
         val iv = ByteArray(if (cipherId.contentEquals(CIPHER_CHACHA20)) 12 else 16).also(random::nextBytes)
         val compression = ByteBuffer.wrap(headerFields[3] ?: Crypto.le4(1)).order(ByteOrder.LITTLE_ENDIAN).getInt()
-        kdf.items["S"]?.let { it.value = ByteArray((it.value as ByteArray).size).also(random::nextBytes) }
 
         val header = ByteArrayOutputStream()
         header.write(byteArrayOf(0x03, 0xD9.toByte(), 0xA2.toByte(), 0x9A.toByte(), 0x67, 0xFB.toByte(), 0x4B, 0xB5.toByte()))
@@ -72,10 +91,9 @@ class KdbxDatabase internal constructor(
         field(0, byteArrayOf(0x0D, 0x0A, 0x0D, 0x0A))
         val headerBytes = header.toByteArray()
 
-        val transformed = Kdf.transform(kdf, composite)
-        val cipherKey = Crypto.sha256(masterSeed, transformed)
-        val hmacBase = Crypto.sha512(masterSeed, transformed, byteArrayOf(1))
-        transformed.fill(0)
+        val tk = transformedKey()
+        val cipherKey = Crypto.sha256(masterSeed, tk)
+        val hmacBase = Crypto.sha512(masterSeed, tk, byteArrayOf(1))
 
         // Intestazione interna + XML (valori protetti ricifrati con una nuova chiave).
         val innerKey = ByteArray(64).also(random::nextBytes)
@@ -133,12 +151,43 @@ class KdbxDatabase internal constructor(
         private val SALSA_IV = Crypto.hex("E830094B97205D2A")
         private val b64 = Base64.getEncoder(); private val b64d = Base64.getDecoder()
 
-        fun compositeKeyOf(password: CharArray): ByteArray {
-            val bytes = String(password).toByteArray(Charsets.UTF_8)
-            val h = Crypto.sha256(Crypto.sha256(bytes)); bytes.fill(0); return h
+        fun compositeKeyOf(password: CharArray): ByteArray = compositeKeyOf(password, null)
+
+        /** Chiave composta KeePass: SHA-256 di [SHA-256(password)] + [hash del file chiave]. Almeno uno dei due. */
+        fun compositeKeyOf(password: CharArray?, keyFile: ByteArray?): ByteArray {
+            require(password != null || keyFile != null) { "Serve almeno una password o un file chiave" }
+            val parts = ArrayList<ByteArray>()
+            if (password != null) {
+                val bytes = String(password).toByteArray(Charsets.UTF_8)
+                parts += Crypto.sha256(bytes); bytes.fill(0)
+            }
+            if (keyFile != null) parts += keyFileHash(keyFile)
+            return Crypto.sha256(*parts.toTypedArray())
         }
 
+        /** Formati di file chiave: XML v1/v2, 32 byte grezzi, 64 caratteri esadecimali, o SHA-256 del contenuto. */
+        internal fun keyFileHash(c: ByteArray): ByteArray {
+            if (c.size > 1 shl 20) return Crypto.sha256(c)
+            val text = String(c, Charsets.UTF_8)
+            if (text.contains("<KeyFile>")) {
+                try {
+                    val d = secureFactory().newDocumentBuilder().parse(ByteArrayInputStream(c))
+                    val data = d.getElementsByTagName("Data").item(0) as Element
+                    val version = d.getElementsByTagName("Version").item(0)?.textContent?.trim() ?: "1.0"
+                    val raw = if (version.startsWith("2")) hexOf(data.textContent.filter { !it.isWhitespace() })
+                              else b64d.decode(data.textContent.trim())
+                    if (raw.size == 32) return raw
+                } catch (e: Exception) { /* non è un XML valido: si usa l'hash del contenuto */ }
+            }
+            if (c.size == 32) return c.copyOf()
+            if (c.size == 64 && text.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }) return hexOf(text)
+            return Crypto.sha256(c)
+        }
+        private fun hexOf(s: String) = ByteArray(s.length / 2) { s.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+
         fun open(data: ByteArray, password: CharArray): KdbxDatabase = openWithKey(data, compositeKeyOf(password))
+        fun open(data: ByteArray, password: CharArray?, keyFile: ByteArray?): KdbxDatabase =
+            openWithKey(data, compositeKeyOf(password, keyFile))
 
         fun openWithKey(data: ByteArray, composite: ByteArray): KdbxDatabase {
             val bb = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
@@ -170,6 +219,7 @@ class KdbxDatabase internal constructor(
             val kdf = VarDict.parse(kdfRaw)
 
             val transformed = Kdf.transform(kdf, composite)
+            val tcopy = transformed.copyOf()
             val hmacBase = Crypto.sha512(seed, transformed, byteArrayOf(1))
             val cipherKey = Crypto.sha256(seed, transformed)
             transformed.fill(0)
@@ -211,7 +261,7 @@ class KdbxDatabase internal constructor(
 
             val doc = parseXml(plain.copyOfRange(pb.position(), plain.size))
             xorProtected(doc, innerStream(streamId, innerKey), encrypt = false)
-            return KdbxDatabase(doc, composite.copyOf(), fields, kdf, bins, streamId)
+            return KdbxDatabase(doc, composite.copyOf(), fields, kdf, bins, streamId, transformedInit = tcopy)
         }
 
 
@@ -296,14 +346,16 @@ class KdbxDatabase internal constructor(
         }
 
         /** Nuovo database vuoto (AES-256, Argon2d 64 MiB, gzip). */
-        fun create(name: String, password: CharArray): KdbxDatabase {
+        fun create(name: String, password: CharArray): KdbxDatabase = create(name, compositeKeyOf(password))
+
+        fun create(name: String, composite: ByteArray): KdbxDatabase {
             val r = SecureRandom()
             val now = nowIso()
             val xml = """<?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <KeePassFile><Meta><Generator>Custode</Generator><DatabaseName>${esc(name)}</DatabaseName><DatabaseNameChanged>$now</DatabaseNameChanged><DatabaseDescription></DatabaseDescription><DatabaseDescriptionChanged>$now</DatabaseDescriptionChanged><DefaultUserName></DefaultUserName><DefaultUserNameChanged>$now</DefaultUserNameChanged><MaintenanceHistoryDays>365</MaintenanceHistoryDays><Color></Color><MasterKeyChanged>$now</MasterKeyChanged><MasterKeyChangeRec>-1</MasterKeyChangeRec><MasterKeyChangeForce>-1</MasterKeyChangeForce><MemoryProtection><ProtectTitle>False</ProtectTitle><ProtectUserName>False</ProtectUserName><ProtectPassword>True</ProtectPassword><ProtectURL>False</ProtectURL><ProtectNotes>False</ProtectNotes></MemoryProtection><RecycleBinEnabled>False</RecycleBinEnabled><HistoryMaxItems>10</HistoryMaxItems><HistoryMaxSize>6291456</HistoryMaxSize><Binaries/><CustomData/></Meta><Root><Group><UUID>${newUuid()}</UUID><Name>${esc(name)}</Name><Notes></Notes><IconID>48</IconID>${times(now)}<IsExpanded>True</IsExpanded><DefaultAutoTypeSequence></DefaultAutoTypeSequence><EnableAutoType>null</EnableAutoType><EnableSearching>null</EnableSearching></Group><DeletedObjects/></Root></KeePassFile>"""
             val fields = linkedMapOf(2 to CIPHER_AES, 3 to Crypto.le4(1))
             val kdf = Kdf.newArgon2d(salt = ByteArray(32).also(r::nextBytes))
-            return KdbxDatabase(parseXml(xml.toByteArray(Charsets.UTF_8)), compositeKeyOf(password), fields, kdf, emptyList(), 3)
+            return KdbxDatabase(parseXml(xml.toByteArray(Charsets.UTF_8)), composite.copyOf(), fields, kdf, emptyList(), 3)
         }
 
         internal fun nowIso(): String = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS).toString()
@@ -315,13 +367,18 @@ class KdbxDatabase internal constructor(
             "<Times><CreationTime>$now</CreationTime><LastModificationTime>$now</LastModificationTime><LastAccessTime>$now</LastAccessTime><ExpiryTime>$now</ExpiryTime><Expires>False</Expires><UsageCount>0</UsageCount><LocationChanged>$now</LocationChanged></Times>"
         internal fun esc(s: String) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-        private fun parseXml(b: ByteArray): Document {
+        private fun secureFactory(): DocumentBuilderFactory {
             val f = DocumentBuilderFactory.newInstance()
             // Il file può essere ostile: niente DTD né entità esterne.
             runCatching { f.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true) }
             runCatching { f.setFeature("http://xml.org/sax/features/external-general-entities", false) }
             runCatching { f.setFeature("http://xml.org/sax/features/external-parameter-entities", false) }
             runCatching { f.isXIncludeAware = false; f.isExpandEntityReferences = false }
+            return f
+        }
+
+        private fun parseXml(b: ByteArray): Document {
+            val f = secureFactory()
             try {
                 val d = f.newDocumentBuilder().parse(ByteArrayInputStream(b))
                 require(d.documentElement.tagName == "KeePassFile" && d.documentElement.child("Root")?.child("Group") != null)

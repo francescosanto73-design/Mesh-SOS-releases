@@ -69,7 +69,7 @@ internal object Kdf {
     val ARGON2ID = Crypto.hex("9e298b1956db4773b23dfc3ec6f0a1e6")
     val AES_KDF = Crypto.hex("c9d9f39a628a4460bf740d08c18a4fea")
 
-    fun newArgon2d(memoryMiB: Int = 64, iterations: Long = 8, parallelism: Int = 2, salt: ByteArray): VarDict =
+    fun newArgon2d(memoryMiB: Int = 64, iterations: Long = 4, parallelism: Int = 2, salt: ByteArray): VarDict =
         VarDict().apply {
             items["\$UUID"] = VarDict.Item(0x42, ARGON2D)
             items["S"] = VarDict.Item(0x42, salt)
