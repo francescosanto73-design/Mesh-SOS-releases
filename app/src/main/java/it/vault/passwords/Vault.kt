@@ -44,7 +44,12 @@ class Vault(private val file: File) {
         persist()
     }
 
-    fun unlock(master: CharArray) {
+    fun unlock(master: CharArray) = load { s -> derive(master, s) }
+
+    /** Sblocco con la chiave grezza (usata dallo sblocco biometrico). */
+    fun unlockWithKey(raw: ByteArray) = load { SecretKeySpec(raw, "AES") }
+
+    private fun load(keyFor: (ByteArray) -> SecretKeySpec) {
         val data = file.readBytes()
         require(data.size > MAGIC.size + SALT_LEN + IV_LEN && data.copyOfRange(0, MAGIC.size).contentEquals(MAGIC)) {
             "File non valido"
@@ -52,7 +57,7 @@ class Vault(private val file: File) {
         val s = data.copyOfRange(MAGIC.size, MAGIC.size + SALT_LEN)
         val iv = data.copyOfRange(MAGIC.size + SALT_LEN, MAGIC.size + SALT_LEN + IV_LEN)
         val ct = data.copyOfRange(MAGIC.size + SALT_LEN + IV_LEN, data.size)
-        val k = derive(master, s)
+        val k = keyFor(s)
         val plain = try {
             Cipher.getInstance(TRANSFORM).run {
                 init(Cipher.DECRYPT_MODE, k, GCMParameterSpec(128, iv))
@@ -78,6 +83,25 @@ class Vault(private val file: File) {
         key = null
         salt = null
         entries = emptyList()
+    }
+
+    fun keyBytes(): ByteArray = checkNotNull(key).encoded
+
+    /** Il file è già cifrato: l'export è una copia byte per byte. */
+    fun exportTo(out: java.io.OutputStream) { file.inputStream().use { it.copyTo(out) } }
+
+    /** Sostituisce il caveau con un backup, dopo aver verificato che la password lo apra. */
+    fun replaceFrom(bytes: ByteArray, master: CharArray) {
+        val tmp = File(file.parentFile, file.name + ".import")
+        tmp.writeBytes(bytes)
+        try {
+            Vault(tmp).unlock(master)
+        } catch (e: Exception) {
+            tmp.delete(); throw e
+        }
+        file.delete()
+        check(tmp.renameTo(file)) { "Ripristino fallito" }
+        lock(); unlock(master)
     }
 
     fun upsert(e: Entry) {

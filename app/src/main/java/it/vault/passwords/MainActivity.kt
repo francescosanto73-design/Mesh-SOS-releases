@@ -7,10 +7,13 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PersistableBundle
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.view.WindowManager
-import androidx.activity.ComponentActivity
+import android.widget.Toast
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.biometric.BiometricPrompt
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -28,32 +31,156 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.ViewModel
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import javax.crypto.Cipher
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class VaultViewModel : ViewModel() {
     lateinit var vault: Vault
     var unlocked by mutableStateOf(false)
     var version by mutableIntStateOf(0) // forza il refresh della lista
+    var bioEnabled by mutableStateOf(false)
+    var pendingImport by mutableStateOf<ByteArray?>(null)
+    var autoPrompted = false
+    var keepUnlocked = false // true mentre è aperto un selettore file di sistema
+
     fun init(f: File) { if (!::vault.isInitialized) vault = Vault(f) }
-    fun lock() { if (::vault.isInitialized) { vault.lock(); unlocked = false; version++ } }
+    fun lock() {
+        if (::vault.isInitialized) { vault.lock(); unlocked = false; version++ }
+        autoPrompted = false
+    }
 }
 
-class MainActivity : ComponentActivity() {
+class Actions(
+    val copy: (String, String) -> Unit,
+    val bioAvailable: Boolean,
+    val unlockBio: () -> Unit,
+    val setBio: (Boolean) -> Unit,
+    val export: () -> Unit,
+    val restore: () -> Unit,
+)
+
+class MainActivity : FragmentActivity() {
     private val vm: VaultViewModel by viewModels()
+    private lateinit var bio: BioUnlock
+
+    private val exportLauncher = registerForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+        vm.keepUnlocked = false
+        if (uri != null) {
+            val ok = runCatching { contentResolver.openOutputStream(uri)?.use { vm.vault.exportTo(it) } ?: error("") }.isSuccess
+            toast(if (ok) "Backup cifrato salvato" else "Esportazione fallita")
+        }
+    }
+
+    private val importLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        vm.keepUnlocked = false
+        if (uri != null) {
+            runCatching {
+                val bytes = contentResolver.openInputStream(uri)!!.use { it.readBytes() }
+                require(bytes.size < 20_000_000)
+                vm.pendingImport = bytes
+            }.onFailure { toast("File non leggibile") }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Blocca screenshot e anteprima nelle app recenti.
         window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
         vm.init(File(filesDir, "vault.bin"))
-        setContent { MaterialTheme { Surface(Modifier.fillMaxSize()) { App(vm, ::copySecret) } } }
+        bio = BioUnlock(this)
+        vm.bioEnabled = bio.enabled && bio.available()
+        val actions = Actions(
+            copy = ::copySecret,
+            bioAvailable = bio.available(),
+            unlockBio = ::unlockWithBio,
+            setBio = ::setBio,
+            export = {
+                vm.keepUnlocked = true
+                exportLauncher.launch("custode-backup-" + SimpleDateFormat("yyyyMMdd", Locale.US).format(Date()) + ".cpv")
+            },
+            restore = { vm.keepUnlocked = true; importLauncher.launch(arrayOf("*/*")) },
+        )
+        setContent { MaterialTheme { Surface(Modifier.fillMaxSize()) { App(vm, actions) } } }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (!vm.unlocked && vm.vault.exists && vm.bioEnabled && !vm.autoPrompted) {
+            vm.autoPrompted = true
+            unlockWithBio()
+        }
     }
 
     override fun onStop() {
         super.onStop()
-        if (!isChangingConfigurations) vm.lock() // blocco automatico in background
+        if (!isChangingConfigurations && !vm.keepUnlocked) vm.lock() // blocco automatico in background
+    }
+
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+
+    private fun prompt(title: String, cipher: Cipher, onOk: (Cipher) -> Unit) {
+        val info = BiometricPrompt.PromptInfo.Builder()
+            .setTitle(title)
+            .setNegativeButtonText("Usa la password")
+            .setAllowedAuthenticators(androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG)
+            .build()
+        BiometricPrompt(this, ContextCompat.getMainExecutor(this), object : BiometricPrompt.AuthenticationCallback() {
+            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                result.cryptoObject?.cipher?.let(onOk)
+            }
+            override fun onAuthenticationError(code: Int, msg: CharSequence) {
+                if (code != BiometricPrompt.ERROR_USER_CANCELED && code != BiometricPrompt.ERROR_NEGATIVE_BUTTON &&
+                    code != BiometricPrompt.ERROR_CANCELED
+                ) toast(msg.toString())
+            }
+        }).authenticate(info, BiometricPrompt.CryptoObject(cipher))
+    }
+
+    private fun setBio(on: Boolean) {
+        if (!on) { bio.disable(); vm.bioEnabled = false; return }
+        if (!vm.unlocked) return
+        try {
+            val cipher = bio.encryptCipher()
+            prompt("Attiva lo sblocco con impronta", cipher) { c ->
+                val raw = vm.vault.keyBytes()
+                try {
+                    bio.store(c, raw); vm.bioEnabled = true; toast("Sblocco con impronta attivato")
+                } catch (e: Exception) {
+                    bio.disable(); toast("Attivazione fallita")
+                } finally { raw.fill(0) }
+            }
+        } catch (e: Exception) {
+            bio.disable(); toast("Impronta non disponibile su questo telefono")
+        }
+    }
+
+    private fun unlockWithBio() {
+        val cipher = try {
+            bio.decryptCipher()
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            bio.disable(); vm.bioEnabled = false
+            toast("Le impronte sono cambiate: usa la password e riattiva lo sblocco"); return
+        } catch (e: Exception) {
+            toast("Sblocco con impronta non disponibile: usa la password"); return
+        }
+        prompt("Sblocca il caveau", cipher) { c ->
+            val raw = runCatching { bio.read(c) }.getOrNull()
+            if (raw == null) { toast("Sblocco non riuscito: usa la password"); return@prompt }
+            try {
+                vm.vault.unlockWithKey(raw); vm.unlocked = true; vm.version++
+            } catch (e: Exception) {
+                toast("Sblocco non riuscito: usa la password")
+            } finally { raw.fill(0) }
+        }
     }
 
     private fun copySecret(label: String, text: String) {
@@ -72,15 +199,50 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun App(vm: VaultViewModel, copy: (String, String) -> Unit) {
-    when {
-        vm.unlocked -> VaultScreen(vm, copy)
-        else -> LoginScreen(vm)
-    }
+fun App(vm: VaultViewModel, act: Actions) {
+    if (vm.unlocked) VaultScreen(vm, act) else LoginScreen(vm, act)
+    vm.pendingImport?.let { ImportDialog(vm, act) }
 }
 
 @Composable
-fun LoginScreen(vm: VaultViewModel) {
+fun ImportDialog(vm: VaultViewModel, act: Actions) {
+    var pw by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    AlertDialog(
+        onDismissRequest = { if (!busy) vm.pendingImport = null },
+        title = { Text("Ripristina backup") },
+        text = {
+            Column {
+                Text("Inserisci la password principale con cui è stato creato il backup. I dati attuali di questo telefono verranno sostituiti.")
+                Spacer(Modifier.height(8.dp))
+                SecretField("Password del backup", pw) { pw = it }
+                error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            }
+        },
+        confirmButton = {
+            TextButton(enabled = !busy && pw.isNotEmpty(), onClick = {
+                busy = true; error = null
+                val bytes = vm.pendingImport!!
+                val chars = pw.toCharArray()
+                scope.launch(Dispatchers.Default) {
+                    val r = runCatching { vm.vault.replaceFrom(bytes, chars) }
+                    chars.fill('\u0000')
+                    withContext(Dispatchers.Main) {
+                        busy = false
+                        r.onSuccess { act.setBio(false); vm.pendingImport = null; vm.unlocked = true; vm.version++ }
+                            .onFailure { error = if (it is WrongPasswordException) "Password errata" else "File non valido" }
+                    }
+                }
+            }) { Text(if (busy) "Attendere…" else "Ripristina") }
+        },
+        dismissButton = { TextButton(enabled = !busy, onClick = { vm.pendingImport = null }) { Text("Annulla") } },
+    )
+}
+
+@Composable
+fun LoginScreen(vm: VaultViewModel, act: Actions) {
     val creating = !vm.vault.exists
     var pw by remember { mutableStateOf("") }
     var pw2 by remember { mutableStateOf("") }
@@ -122,10 +284,10 @@ fun LoginScreen(vm: VaultViewModel) {
                 if (creating && pw != pw2) { error = "Le password non coincidono"; return@Button }
                 busy = true
                 val chars = pw.toCharArray()
-                scope.launch(kotlinx.coroutines.Dispatchers.Default) {
+                scope.launch(Dispatchers.Default) {
                     val result = runCatching { if (creating) vm.vault.create(chars) else vm.vault.unlock(chars) }
                     chars.fill('\u0000')
-                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    withContext(Dispatchers.Main) {
                         busy = false
                         result.onSuccess { pw = ""; pw2 = ""; vm.unlocked = true; vm.version++ }
                             .onFailure { error = if (it is WrongPasswordException) "Password errata" else "Errore: ${it.message}" }
@@ -133,6 +295,16 @@ fun LoginScreen(vm: VaultViewModel) {
                 }
             },
         ) { Text(if (busy) "Attendere…" else if (creating) "Crea caveau" else "Sblocca") }
+        if (!creating && vm.bioEnabled) {
+            OutlinedButton(onClick = act.unlockBio, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                Icon(Icons.Default.Fingerprint, null); Spacer(Modifier.width(8.dp)); Text("Usa l'impronta")
+            }
+        }
+        if (creating) {
+            TextButton(onClick = act.restore, modifier = Modifier.align(Alignment.CenterHorizontally)) {
+                Text("Ripristina da backup")
+            }
+        }
     }
 }
 
@@ -148,7 +320,9 @@ fun SecretField(label: String, value: String, onChange: (String) -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun VaultScreen(vm: VaultViewModel, copy: (String, String) -> Unit) {
+fun VaultScreen(vm: VaultViewModel, act: Actions) {
+    val copy = act.copy
+    var menu by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
     var editing by remember { mutableStateOf<Entry?>(null) }
     var showEditor by remember { mutableStateOf(false) }
@@ -163,7 +337,18 @@ fun VaultScreen(vm: VaultViewModel, copy: (String, String) -> Unit) {
         topBar = {
             TopAppBar(
                 title = { Text("Password") },
-                actions = { IconButton(onClick = { vm.lock() }) { Icon(Icons.Default.Lock, "Blocca") } },
+                actions = {
+                    IconButton(onClick = { vm.lock() }) { Icon(Icons.Default.Lock, "Blocca") }
+                    IconButton(onClick = { menu = true }) { Icon(Icons.Default.MoreVert, "Menu") }
+                    DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                        DropdownMenuItem(text = { Text("Esporta backup cifrato") }, onClick = { menu = false; act.export() })
+                        DropdownMenuItem(text = { Text("Ripristina da backup") }, onClick = { menu = false; act.restore() })
+                        if (act.bioAvailable) DropdownMenuItem(
+                            text = { Text(if (vm.bioEnabled) "Disattiva sblocco con impronta" else "Attiva sblocco con impronta") },
+                            onClick = { menu = false; act.setBio(!vm.bioEnabled) },
+                        )
+                    }
+                },
             )
         },
         floatingActionButton = {

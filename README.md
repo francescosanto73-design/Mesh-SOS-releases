@@ -6,6 +6,8 @@ App Android (Kotlin + Jetpack Compose) per custodire le password in locale, cifr
 - Nessun permesso, nessuna rete, backup Android disattivato
 - Blocco automatico in background, FLAG_SECURE, appunti sensibili cancellati dopo 30 s
 - Generatore di password, ricerca, modifica ed eliminazione
+- Sblocco con impronta (chiave nell'Android Keystore, invalidata se cambiano le impronte)
+- Esporta/ripristina backup cifrato (file `.cpv`, apribile solo con la password principale)
 
 ## Ottenere l'APK
 Su GitHub: **Actions → Build APK → ultima esecuzione → Artifacts → CustodePassword-debug**,
