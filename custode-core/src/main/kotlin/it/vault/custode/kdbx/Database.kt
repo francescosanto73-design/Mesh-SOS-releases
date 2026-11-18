@@ -36,12 +36,14 @@ class KdbxDatabase internal constructor(
     private var composite: ByteArray,
     private val headerFields: LinkedHashMap<Int, ByteArray>,
     private val kdf: VarDict,
-    private val binaries: List<ByteArray>,
+    binaries0: List<ByteArray>,
     private val innerStreamId: Int,
     /** true se il file originale era KDBX 3: al salvataggio viene convertito in KDBX 4. */
     val upgradedFromV3: Boolean = false,
     transformedInit: ByteArray? = null,
 ) {
+    private val binaries: MutableList<ByteArray> = binaries0.toMutableList()
+
     /** Risultato della KDF (Argon2): riusato per i salvataggi nella stessa sessione, così salvare è rapido. */
     private var transformed: ByteArray? = transformedInit
     /** Esegue in anticipo la KDF (lenta): i salvataggi successivi diventano rapidi. Chiamare fuori dal thread UI. */
@@ -75,6 +77,146 @@ class KdbxDatabase internal constructor(
 
     fun allEntries(): List<KdbxEntry> = root.entriesRecursive()
 
+    // ---- Ricerca, cestino, storico, allegati ----
+
+    private val meta: Element get() = doc.documentElement.child("Meta")!!
+
+    /** Voci "vive" (esclude il cestino): da usare per ricerca e compilazione automatica. */
+    fun activeEntries(): List<KdbxEntry> { val bin = recycleBin; return allEntries().filter { bin == null || !isInside(it.el, bin.el) } }
+
+    fun findGroup(id: String): KdbxGroup? {
+        fun walk(g: KdbxGroup): KdbxGroup? = if (g.id == id) g else g.groups.firstNotNullOfOrNull { walk(it) }
+        return walk(root)
+    }
+
+    val recycleBin: KdbxGroup?
+        get() {
+            if (meta.child("RecycleBinEnabled")?.textContent.equals("False", true)) return null
+            val id = meta.child("RecycleBinUUID")?.textContent ?: return null
+            return if (id.isBlank() || id == ZERO_UUID) null else findGroup(id)
+        }
+
+    fun isInRecycleBin(entry: KdbxEntry): Boolean = recycleBin?.let { isInside(entry.el, it.el) } ?: false
+    fun isInRecycleBin(group: KdbxGroup): Boolean = recycleBin?.let { isInside(group.el, it.el) } ?: false
+
+    private fun isInside(e: Element, ancestor: Element): Boolean {
+        var n: org.w3c.dom.Node? = e
+        while (n != null) { if (n === ancestor) return true; n = n.parentNode }
+        return false
+    }
+
+    private fun ensureRecycleBin(): KdbxGroup? {
+        if (meta.child("RecycleBinEnabled")?.textContent.equals("False", true)) return null
+        recycleBin?.let { return it }
+        val g = root.addGroup("Cestino")
+        g.el.child("IconID")?.textContent = "43"
+        listOf("EnableAutoType" to "false", "EnableSearching" to "false").forEach { (k, v) ->
+            g.el.appendChild(doc.createElement(k).also { it.textContent = v })
+        }
+        fun setMeta(name: String, v: String) {
+            (meta.child(name) ?: doc.createElement(name).also { meta.appendChild(it) }).textContent = v
+        }
+        setMeta("RecycleBinEnabled", "True"); setMeta("RecycleBinUUID", g.id); setMeta("RecycleBinChanged", nowIso())
+        return g
+    }
+
+    /** Sposta nel cestino (se attivo) oppure elimina definitivamente; se è già nel cestino, elimina definitivamente. */
+    fun trash(entry: KdbxEntry) {
+        val bin = ensureRecycleBin()
+        if (bin == null || isInRecycleBin(entry)) delete(entry) else move(entry, bin)
+    }
+
+    fun trash(group: KdbxGroup) {
+        val bin = ensureRecycleBin()
+        if (bin == null || isInRecycleBin(group) || group.id == bin.id) delete(group) else moveGroup(group, bin)
+    }
+
+    fun move(entry: KdbxEntry, target: KdbxGroup) {
+        val prev = (entry.el.parentNode as Element).child("UUID")?.textContent
+        target.el.appendChild(entry.el)
+        if (prev != null) {
+            (entry.el.child("PreviousParentGroup") ?: doc.createElement("PreviousParentGroup").also { entry.el.appendChild(it) }).textContent = prev
+        }
+        entry.el.child("Times")?.child("LocationChanged")?.textContent = nowIso()
+    }
+
+    fun moveGroup(group: KdbxGroup, target: KdbxGroup) {
+        require(!isInside(target.el, group.el)) { "Non si può spostare un gruppo dentro se stesso" }
+        target.el.appendChild(group.el)
+        group.el.child("Times")?.child("LocationChanged")?.textContent = nowIso()
+    }
+
+    /** Riporta una voce dal cestino nel gruppo di origine (o nella radice). */
+    fun restore(entry: KdbxEntry) {
+        val prev = entry.el.child("PreviousParentGroup")?.textContent?.let { findGroup(it) }
+        move(entry, prev?.takeIf { !isInRecycleBin(it) } ?: root)
+        entry.el.child("PreviousParentGroup")?.let { entry.el.removeChild(it) }
+    }
+
+    fun emptyRecycleBin() {
+        val bin = recycleBin ?: return
+        bin.entries.forEach { delete(it) }; bin.groups.forEach { delete(it) }
+    }
+
+    /** Modifica una voce conservando la versione precedente nello storico (solo se qualcosa è cambiato). */
+    fun edit(entry: KdbxEntry, block: KdbxEntry.() -> Unit) {
+        val before = entry.fingerprint()
+        val snapshot = entry.el.cloneNode(true) as Element
+        snapshot.child("History")?.let { snapshot.removeChild(it) }
+        entry.block()
+        if (entry.fingerprint() == before) return
+        val h = entry.el.child("History") ?: doc.createElement("History").also { entry.el.appendChild(it) }
+        h.appendChild(snapshot)
+        val max = meta.child("HistoryMaxItems")?.textContent?.toIntOrNull() ?: 10
+        if (max >= 0) while (h.children("Entry").size > max) h.removeChild(h.children("Entry").first())
+    }
+
+    /** Ripristina i campi di una versione precedente (la versione corrente finisce a sua volta nello storico). */
+    fun restoreVersion(entry: KdbxEntry, version: KdbxEntry) = edit(entry) {
+        (el.children("String") + el.children("Binary")).forEach { el.removeChild(it) }
+        val anchor = el.child("History")
+        (version.el.children("String") + version.el.children("Binary")).forEach {
+            val c = it.cloneNode(true)
+            if (anchor != null) el.insertBefore(c, anchor) else el.appendChild(c)
+        }
+        KdbxEntry.touch(el)
+    }
+
+    fun attachmentBytes(entry: KdbxEntry, name: String): ByteArray? {
+        val ref = entry.attachmentRef(name) ?: return null
+        return binaries.getOrNull(ref)?.let { if (it.isEmpty()) ByteArray(0) else it.copyOfRange(1, it.size) }
+    }
+
+    fun addAttachment(entry: KdbxEntry, name: String, data: ByteArray) = edit(entry) {
+        removeAttachmentEl(name)
+        binaries.add(byteArrayOf(0) + data)
+        val b = el.ownerDocument.createElement("Binary")
+        b.appendChild(el.ownerDocument.createElement("Key").also { it.textContent = name })
+        b.appendChild(el.ownerDocument.createElement("Value").also { it.setAttribute("Ref", (binaries.size - 1).toString()) })
+        val anchor = el.child("History")
+        if (anchor != null) el.insertBefore(b, anchor) else el.appendChild(b)
+        KdbxEntry.touch(el)
+    }
+
+    fun removeAttachment(entry: KdbxEntry, name: String) = edit(entry) { removeAttachmentEl(name); KdbxEntry.touch(el) }
+
+    /** Elimina gli allegati non più referenziati e rinumera i riferimenti. */
+    private fun compactBinaries() {
+        val used = LinkedHashMap<Int, Int>()
+        val values = doc.getElementsByTagName("Value")
+        for (i in 0 until values.length) {
+            val e = values.item(i) as Element
+            if (e.hasAttribute("Ref")) e.getAttribute("Ref").toIntOrNull()?.let { r -> if (r in binaries.indices) used.getOrPut(r) { used.size } }
+        }
+        val compact = ArrayList<ByteArray>(used.size).also { l -> repeat(used.size) { l.add(ByteArray(0)) } }
+        used.forEach { (old, new) -> compact[new] = binaries[old] }
+        for (i in 0 until values.length) {
+            val e = values.item(i) as Element
+            if (e.hasAttribute("Ref")) e.getAttribute("Ref").toIntOrNull()?.let { r -> used[r]?.let { e.setAttribute("Ref", it.toString()) } }
+        }
+        binaries.clear(); binaries.addAll(compact)
+    }
+
     /** Serializza e cifra il database (nuovi salt/IV/chiave interna a ogni salvataggio). */
     fun toBytes(): ByteArray {
         val masterSeed = ByteArray(32).also(random::nextBytes)
@@ -95,6 +237,7 @@ class KdbxDatabase internal constructor(
         val cipherKey = Crypto.sha256(masterSeed, tk)
         val hmacBase = Crypto.sha512(masterSeed, tk, byteArrayOf(1))
 
+        compactBinaries()
         // Intestazione interna + XML (valori protetti ricifrati con una nuova chiave).
         val innerKey = ByteArray(64).also(random::nextBytes)
         val inner = ByteArrayOutputStream()
@@ -146,6 +289,7 @@ class KdbxDatabase internal constructor(
     }
 
     companion object {
+        internal const val ZERO_UUID = "AAAAAAAAAAAAAAAAAAAAAA=="
         internal val CIPHER_AES = Crypto.hex("31c1f2e6bf714350be5805216afc5aff")
         internal val CIPHER_CHACHA20 = Crypto.hex("d6038a2b8b6f4cb5a524339a31dbb59a")
         private val SALSA_IV = Crypto.hex("E830094B97205D2A")
@@ -352,7 +496,7 @@ class KdbxDatabase internal constructor(
             val r = SecureRandom()
             val now = nowIso()
             val xml = """<?xml version="1.0" encoding="utf-8" standalone="yes"?>
-<KeePassFile><Meta><Generator>Custode</Generator><DatabaseName>${esc(name)}</DatabaseName><DatabaseNameChanged>$now</DatabaseNameChanged><DatabaseDescription></DatabaseDescription><DatabaseDescriptionChanged>$now</DatabaseDescriptionChanged><DefaultUserName></DefaultUserName><DefaultUserNameChanged>$now</DefaultUserNameChanged><MaintenanceHistoryDays>365</MaintenanceHistoryDays><Color></Color><MasterKeyChanged>$now</MasterKeyChanged><MasterKeyChangeRec>-1</MasterKeyChangeRec><MasterKeyChangeForce>-1</MasterKeyChangeForce><MemoryProtection><ProtectTitle>False</ProtectTitle><ProtectUserName>False</ProtectUserName><ProtectPassword>True</ProtectPassword><ProtectURL>False</ProtectURL><ProtectNotes>False</ProtectNotes></MemoryProtection><RecycleBinEnabled>False</RecycleBinEnabled><HistoryMaxItems>10</HistoryMaxItems><HistoryMaxSize>6291456</HistoryMaxSize><Binaries/><CustomData/></Meta><Root><Group><UUID>${newUuid()}</UUID><Name>${esc(name)}</Name><Notes></Notes><IconID>48</IconID>${times(now)}<IsExpanded>True</IsExpanded><DefaultAutoTypeSequence></DefaultAutoTypeSequence><EnableAutoType>null</EnableAutoType><EnableSearching>null</EnableSearching></Group><DeletedObjects/></Root></KeePassFile>"""
+<KeePassFile><Meta><Generator>Custode</Generator><DatabaseName>${esc(name)}</DatabaseName><DatabaseNameChanged>$now</DatabaseNameChanged><DatabaseDescription></DatabaseDescription><DatabaseDescriptionChanged>$now</DatabaseDescriptionChanged><DefaultUserName></DefaultUserName><DefaultUserNameChanged>$now</DefaultUserNameChanged><MaintenanceHistoryDays>365</MaintenanceHistoryDays><Color></Color><MasterKeyChanged>$now</MasterKeyChanged><MasterKeyChangeRec>-1</MasterKeyChangeRec><MasterKeyChangeForce>-1</MasterKeyChangeForce><MemoryProtection><ProtectTitle>False</ProtectTitle><ProtectUserName>False</ProtectUserName><ProtectPassword>True</ProtectPassword><ProtectURL>False</ProtectURL><ProtectNotes>False</ProtectNotes></MemoryProtection><RecycleBinEnabled>True</RecycleBinEnabled><HistoryMaxItems>10</HistoryMaxItems><HistoryMaxSize>6291456</HistoryMaxSize><Binaries/><CustomData/></Meta><Root><Group><UUID>${newUuid()}</UUID><Name>${esc(name)}</Name><Notes></Notes><IconID>48</IconID>${times(now)}<IsExpanded>True</IsExpanded><DefaultAutoTypeSequence></DefaultAutoTypeSequence><EnableAutoType>null</EnableAutoType><EnableSearching>null</EnableSearching></Group><DeletedObjects/></Root></KeePassFile>"""
             val fields = linkedMapOf(2 to CIPHER_AES, 3 to Crypto.le4(1))
             val kdf = Kdf.newArgon2d(salt = ByteArray(32).also(r::nextBytes))
             return KdbxDatabase(parseXml(xml.toByteArray(Charsets.UTF_8)), composite.copyOf(), fields, kdf, emptyList(), 3)
@@ -504,17 +648,22 @@ class KdbxEntry internal constructor(internal val el: Element, private val db: K
 
     fun field(key: String): String = stringEl(key)?.child("Value")?.textContent ?: ""
 
-    fun setField(key: String, value: String, protect: Boolean = false) {
+    /** [protect]: null = lascia com'è (nuovi campi: non protetto), true/false = imposta la protezione in memoria. */
+    fun setField(key: String, value: String, protect: Boolean? = null) {
         val doc = el.ownerDocument
         val existing = stringEl(key)
         if (existing != null) {
-            existing.child("Value")?.textContent = value
+            existing.child("Value")?.let {
+                it.textContent = value
+                if (protect == true) it.setAttribute("Protected", "True")
+                else if (protect == false && it.hasAttribute("Protected")) it.removeAttribute("Protected")
+            }
         } else {
             val s = doc.createElement("String")
             s.appendChild(doc.createElement("Key").also { it.textContent = key })
             s.appendChild(doc.createElement("Value").also {
                 it.textContent = value
-                if (protect) it.setAttribute("Protected", "True")
+                if (protect == true) it.setAttribute("Protected", "True")
             })
             val last = el.children("String").lastOrNull()
             val anchor = last?.nextSibling ?: el.child("Times")?.nextSibling
@@ -522,6 +671,26 @@ class KdbxEntry internal constructor(internal val el: Element, private val db: K
         }
         touch(el)
     }
+
+
+    val modified: String get() = el.child("Times")?.child("LastModificationTime")?.textContent ?: ""
+    /** Versioni precedenti (dalla più vecchia alla più recente). */
+    val history: List<KdbxEntry> get() = el.child("History")?.children("Entry")?.map { KdbxEntry(it, db) } ?: emptyList()
+
+    val attachments: List<String> get() = el.children("Binary").mapNotNull { it.child("Key")?.textContent }
+    internal fun attachmentRef(name: String): Int? =
+        el.children("Binary").firstOrNull { it.child("Key")?.textContent == name }?.child("Value")?.getAttribute("Ref")?.toIntOrNull()
+    internal fun removeAttachmentEl(name: String) {
+        el.children("Binary").filter { it.child("Key")?.textContent == name }.forEach { el.removeChild(it) }
+    }
+
+    fun isProtected(key: String): Boolean = stringEl(key)?.child("Value")?.getAttribute("Protected").equals("True", true)
+    fun removeField(key: String) { stringEl(key)?.let { el.removeChild(it); touch(el) } }
+
+    /** Impronta dei contenuti modificabili: serve a capire se vale la pena salvare una versione nello storico. */
+    internal fun fingerprint(): String = el.children("String").joinToString("\u0001") {
+        (it.child("Key")?.textContent ?: "") + "=" + (it.child("Value")?.textContent ?: "") + "/" + (it.child("Value")?.getAttribute("Protected") ?: "")
+    } + "|" + el.children("Binary").joinToString(",") { (it.child("Key")?.textContent ?: "") + (it.child("Value")?.getAttribute("Ref") ?: "") }
 
     /** Campi personalizzati (tutto tranne i cinque standard). */
     val customFields: Map<String, String>

@@ -22,3 +22,7 @@ jobs:
         working-directory: custode-core
       - run: python3 tests/keepassxc_test.py
         working-directory: custode-core
+      - run: python3 tests/extras_test.py
+        working-directory: custode-core
+      - run: gradle --no-daemon test
+        working-directory: custode-core

@@ -46,7 +46,24 @@ fun main(args: Array<String>) {
                 val db = KdbxDatabase.open(File(args[1]).readBytes(), pw(args[3]), kf())
                 File(args[2]).writeBytes(db.toBytes())
             }
-            else -> { System.err.println("uso: dump|create|roundtrip"); exitProcess(2) }
+            // totp <file> <pw> <titolo>: stampa il codice corrente e i secondi rimasti
+            "totp" -> {
+                val db = KdbxDatabase.open(File(args[1]).readBytes(), pw(args[2]), kf())
+                val e = db.allEntries().first { it.title == args[3] }
+                val spec = Totp.of(e) ?: run { println("NOTOTP"); return }
+                println(Totp.code(spec) + "\t" + Totp.secondsLeft(spec))
+            }
+            // ops <in> <out> <pw>: cestino, storico, allegati (scenario fisso, per i test)
+            "ops" -> {
+                val db = KdbxDatabase.open(File(args[1]).readBytes(), pw(args[3]), kf())
+                val e = db.activeEntries().first { it.title == "Modificabile" }
+                db.edit(e) { password = "nuova-password"; setField("Extra", "valore", protect = true) }
+                db.edit(e) { password = "ancora-piu-nuova" }
+                db.addAttachment(e, "nota.txt", "contenuto allegato".toByteArray())
+                db.trash(db.activeEntries().first { it.title == "DaCestinare" })
+                File(args[2]).writeBytes(db.toBytes())
+            }
+            else -> { System.err.println("uso: dump|create|roundtrip|totp|ops"); exitProcess(2) }
         }
     } catch (e: WrongCredentialsException) { System.err.println("WRONG_PASSWORD"); exitProcess(3) }
     catch (e: UnsupportedFormatException) { System.err.println("UNSUPPORTED: ${e.message}"); exitProcess(4) }
