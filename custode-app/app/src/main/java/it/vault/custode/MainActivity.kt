@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.net.Uri
 import androidx.activity.compose.setContent
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -29,6 +30,8 @@ class AppVm : ViewModel() {
     var keyFile by mutableStateOf<ByteArray?>(null)
     var keyFileName by mutableStateOf<String?>(null)
     var pendingImport by mutableStateOf<ByteArray?>(null)
+    var textImport by mutableStateOf<List<it.vault.custode.importer.Parsed>?>(null)  // righe del file di testo da importare
+    var textUri: Uri? = null
     var autoPrompted = false
     var keepUnlocked = false                       // true mentre è aperto un selettore file di sistema
 
@@ -41,6 +44,7 @@ class AppVm : ViewModel() {
     fun lock() {
         if (::store.isInitialized) store.lock()
         unlocked = false; groupStack.clear(); selectedEntry = null
+        textImport = null; textUri = null            // le password lette dal file di testo non devono restare in memoria
         keyFile = null; keyFileName = null; autoPrompted = false; version++
     }
 
@@ -68,6 +72,8 @@ class Actions(
     val export: () -> Unit,
     val pickDatabase: (() -> Unit)?,
     val pickKeyFile: () -> Unit,
+    val pickTextFile: () -> Unit,
+    val deleteTextFile: () -> Boolean,
     val saveFile: (String, ByteArray) -> Unit,
     val pickAttachment: ((String, ByteArray) -> Unit) -> Unit,
     val autofillEnabled: () -> Boolean,

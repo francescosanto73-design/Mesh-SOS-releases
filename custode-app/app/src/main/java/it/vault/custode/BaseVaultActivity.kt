@@ -54,6 +54,13 @@ abstract class BaseVaultActivity : FragmentActivity() {
         vm.keepUnlocked = false
         readSmall(uri, 5_000_000)?.let { vm.keyFile = it; vm.keyFileName = displayName(uri!!) }
     }
+    private val textLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        vm.keepUnlocked = false
+        readSmall(uri, 5_000_000)?.let { bytes ->
+            val rows = it.vault.custode.importer.TextImporter.parse(it.vault.custode.importer.TextImporter.decode(bytes))
+            if (rows.isEmpty()) toast("Nel file non ho trovato righe da importare") else { vm.textUri = uri; vm.textImport = rows }
+        }
+    }
     private val attachLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         vm.keepUnlocked = false
         val cb = attachmentCallback; attachmentCallback = null
@@ -80,6 +87,12 @@ abstract class BaseVaultActivity : FragmentActivity() {
         },
         pickDatabase = if (allowImport) ({ vm.keepUnlocked = true; dbLauncher.launch(arrayOf("*/*")) }) else null,
         pickKeyFile = { vm.keepUnlocked = true; keyLauncher.launch(arrayOf("*/*")) },
+        pickTextFile = { vm.keepUnlocked = true; textLauncher.launch(arrayOf("text/*", "*/*")) },
+        deleteTextFile = {
+            val u = vm.textUri
+            vm.textUri = null
+            u != null && runCatching { android.provider.DocumentsContract.deleteDocument(contentResolver, u) }.getOrDefault(false)
+        },
         saveFile = { name, data -> pendingSave = data; vm.keepUnlocked = true; saveFileLauncher.launch(name) },
         pickAttachment = { cb -> attachmentCallback = cb; vm.keepUnlocked = true; attachLauncher.launch(arrayOf("*/*")) },
         autofillEnabled = { runCatching { getSystemService(AutofillManager::class.java)?.hasEnabledAutofillServices() == true }.getOrDefault(false) },

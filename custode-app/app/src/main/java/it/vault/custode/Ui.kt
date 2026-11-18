@@ -219,6 +219,7 @@ fun MainScreen(vm: AppVm, act: Actions) {
         }
         src.sortedBy { it.title.lowercase() }
     }
+    var imported by remember { mutableStateOf<Int?>(null) }
     BackHandler(enabled = stack.isNotEmpty()) { vm.groupStack.removeAt(vm.groupStack.lastIndex) }
 
     Scaffold(
@@ -236,6 +237,7 @@ fun MainScreen(vm: AppVm, act: Actions) {
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                         DropdownMenuItem(text = { Text("Esporta backup (.kdbx)") }, onClick = { menu = false; act.export() })
                         act.pickDatabase?.let { pick -> DropdownMenuItem(text = { Text("Apri un altro database…") }, onClick = { menu = false; pick() }) }
+                        DropdownMenuItem(text = { Text("Importa da un file di testo…") }, onClick = { menu = false; act.pickTextFile() })
                         DropdownMenuItem(text = { Text("Cambia password principale") }, onClick = { menu = false; dialog = "changeKey" })
                         if (act.bioAvailable) DropdownMenuItem(
                             text = { Text(if (vm.bioEnabled) "Disattiva sblocco con impronta" else "Attiva sblocco con impronta") },
@@ -303,6 +305,28 @@ fun MainScreen(vm: AppVm, act: Actions) {
         }
     }
 
+    vm.textImport?.let { rows ->
+        TextImportDialog(rows, onCancel = { vm.textImport = null; vm.textUri = null }, onImport = { chosen ->
+            val g = db.root.addGroup("Importate dal file di testo")
+            chosen.forEach { g.addEntry(it.title.ifBlank { "(senza nome)" }, it.user, it.password, it.url, it.notes) }
+            vm.textImport = null; vm.groupStack.clear(); vm.persist(); imported = chosen.size
+        })
+    }
+    imported?.let { n ->
+        AlertDialog(
+            onDismissRequest = { imported = null },
+            title = { Text("Importate $n voci") },
+            text = { Text("Sono nel gruppo \"Importate dal file di testo\": controllale e spostale dove preferisci.\n\nIl file di testo contiene tutte le password in chiaro. Ti consiglio di eliminarlo subito, e di svuotare il cestino del telefono.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    val ok = act.deleteTextFile()
+                    vm.message = if (ok) "File di testo eliminato" else "Non sono riuscito a eliminarlo da qui: eliminalo dall'app File"
+                    imported = null
+                }) { Text("Elimina il file ora") }
+            },
+            dismissButton = { TextButton(onClick = { vm.textUri = null; imported = null }) { Text("Più tardi") } },
+        )
+    }
     vm.selectedEntry?.let { id ->
         val e = db.allEntries().firstOrNull { it.id == id }
         if (e == null) vm.selectedEntry = null else DetailDialog(
@@ -659,4 +683,75 @@ fun EditorDialog(initial: KdbxEntry?, onSave: (EditorData) -> Unit, onClose: () 
         },
         dismissButton = { TextButton(onClick = onClose) { Text("Annulla") } },
     )
+}
+
+// ───────────────────────────── Importazione da file di testo ─────────────────────────────
+
+@Composable
+fun TextImportDialog(rows: List<it.vault.custode.importer.Parsed>, onCancel: () -> Unit, onImport: (List<it.vault.custode.importer.Parsed>) -> Unit) {
+    val items = remember(rows) { mutableStateListOf<it.vault.custode.importer.Parsed>().apply { addAll(rows) } }
+    var onlyDoubtful by remember { mutableStateOf(false) }
+    var showRaw by remember { mutableStateOf(false) }
+    var editing by remember { mutableStateOf<it.vault.custode.importer.Parsed?>(null) }
+    val doubtful = items.count { !it.confident }
+    val shown = if (onlyDoubtful) items.filter { !it.confident } else items.toList()
+
+    Dialog(onDismissRequest = onCancel) {
+        Surface(shape = RoundedCornerShape(24.dp), tonalElevation = 6.dp, modifier = Modifier.fillMaxWidth().fillMaxHeight(0.92f)) {
+            Column(Modifier.padding(16.dp)) {
+                Text("Anteprima dell'importazione", style = MaterialTheme.typography.titleLarge)
+                Text("${items.size} righe, $doubtful da controllare (⚠). Correggi o togli quelle sbagliate prima di importare.", style = MaterialTheme.typography.bodyMedium)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Switch(checked = onlyDoubtful, onCheckedChange = { onlyDoubtful = it }); Spacer(Modifier.width(8.dp)); Text("Solo da controllare")
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Switch(checked = showRaw, onCheckedChange = { showRaw = it }); Spacer(Modifier.width(8.dp)); Text("Mostra la riga originale e le password")
+                }
+                LazyColumn(Modifier.weight(1f).testTag("importList")) {
+                    items(shown) { r ->
+                        Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                            Text((if (r.confident) "" else "⚠ ") + r.title.ifBlank { "(senza nome)" }, style = MaterialTheme.typography.titleSmall)
+                            if (r.user.isNotBlank()) Text("Utente: ${r.user}")
+                            if (r.password.isNotEmpty()) Text("Password: " + if (showRaw) r.password else "••••••••")
+                            if (r.url.isNotBlank()) Text("Sito: ${r.url}")
+                            if (r.notes.isNotBlank() && !(showRaw.not() && r.password.isEmpty() && r.notes == r.raw)) Text("Note: ${r.notes}")
+                            else if (r.notes.isNotBlank()) Text("Riga non interpretata: finirà nelle note", style = MaterialTheme.typography.bodySmall)
+                            Row {
+                                TextButton(onClick = { editing = r }) { Text("Modifica") }
+                                TextButton(onClick = { items.remove(r) }) { Text("Togli") }
+                            }
+                        }
+                        HorizontalDivider()
+                    }
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    TextButton(onClick = onCancel) { Text("Annulla") }
+                    Button(enabled = items.isNotEmpty(), onClick = { onImport(items.toList()) }, modifier = Modifier.testTag("doImport")) { Text("Importa ${items.size}") }
+                }
+            }
+        }
+    }
+    editing?.let { r ->
+        var t by remember(r) { mutableStateOf(r.title) }; var u by remember(r) { mutableStateOf(r.user) }
+        var p by remember(r) { mutableStateOf(r.password) }; var n by remember(r) { mutableStateOf(r.notes) }
+        AlertDialog(
+            onDismissRequest = { editing = null }, title = { Text("Modifica riga") },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(t, { t = it }, label = { Text("Nome") }, singleLine = true)
+                    OutlinedTextField(u, { u = it }, label = { Text("Utente") }, singleLine = true)
+                    OutlinedTextField(p, { p = it }, label = { Text("Password") }, singleLine = true)
+                    OutlinedTextField(n, { n = it }, label = { Text("Note") }, minLines = 2)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val i = items.indexOf(r)
+                    if (i >= 0) items[i] = it.vault.custode.importer.Parsed(t.trim(), u.trim(), p, r.url, n, confident = true, raw = r.raw)
+                    editing = null
+                }) { Text("Salva") }
+            },
+            dismissButton = { TextButton(onClick = { editing = null }) { Text("Annulla") } },
+        )
+    }
 }
