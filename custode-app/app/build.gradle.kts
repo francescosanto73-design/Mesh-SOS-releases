@@ -11,8 +11,8 @@ android {
         applicationId = "app.custode.vault"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
     }
 
     // Firma: la chiave NON sta nel repository. Si passa da variabili d'ambiente.

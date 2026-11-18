@@ -11,6 +11,25 @@
         android:largeHeap="true"
         android:theme="@style/Theme.Custode">
 
+        <!-- Compilazione automatica: il servizio propone "Custode"; la scelta della voce avviene in AutofillActivity. -->
+        <service
+            android:name=".autofill.CustodeAutofillService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_AUTOFILL_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.autofill.AutofillService" />
+            </intent-filter>
+            <meta-data android:name="android.autofill" android:resource="@xml/autofill_service_config" />
+        </service>
+
+        <activity
+            android:name=".autofill.AutofillActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout|uiMode" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"

@@ -13,6 +13,7 @@ import java.nio.file.StandardCopyOption
  * Le operazioni lente (Argon2) vanno chiamate fuori dal thread UI; [save] è rapido.
  */
 class VaultStore(dir: File) {
+    private val dirPath = dir.absolutePath
     private val file = File(dir, "vault.kdbx")
     var db: KdbxDatabase? = null
         private set
@@ -69,6 +70,17 @@ class VaultStore(dir: File) {
     fun lock() { db?.close(); db = null }
 
     companion object {
+        @Volatile private var instance: VaultStore? = null
+
+        /** Un solo archivio per processo: lo condividono l'app e il servizio di compilazione automatica. */
+        fun get(ctx: android.content.Context): VaultStore {
+            val dir = ctx.applicationContext.filesDir
+            instance?.takeIf { it.dirPath == dir.absolutePath }?.let { return it }
+            return synchronized(this) {
+                instance?.takeIf { it.dirPath == dir.absolutePath } ?: VaultStore(dir).also { instance = it }
+            }
+        }
+
         fun describe(e: Throwable): String = when (e) {
             is WrongCredentialsException -> "Password o file chiave errati"
             is UnsupportedFormatException -> e.message ?: "File non supportato"

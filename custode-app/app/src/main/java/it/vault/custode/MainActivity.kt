@@ -1,38 +1,21 @@
 package it.vault.custode
 
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
-import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.os.PersistableBundle
-import android.security.keystore.KeyPermanentlyInvalidatedException
-import android.view.WindowManager
-import android.widget.Toast
+import android.os.SystemClock
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.activity.viewModels
-import androidx.biometric.BiometricManager
-import androidx.biometric.BiometricPrompt
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.core.content.ContextCompat
-import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
-import javax.crypto.Cipher
 
 class AppVm : ViewModel() {
     lateinit var store: VaultStore
@@ -49,7 +32,11 @@ class AppVm : ViewModel() {
     var autoPrompted = false
     var keepUnlocked = false                       // true mentre è aperto un selettore file di sistema
 
-    fun init(dir: File) { if (!::store.isInitialized) store = VaultStore(dir) }
+    fun init(ctx: Context) {
+        if (!::store.isInitialized) store = VaultStore.get(ctx)
+        // Il database può essere già sbloccato (stesso processo, es. dopo la compilazione automatica).
+        if (store.db != null && !unlocked) unlocked = true
+    }
 
     fun lock() {
         if (::store.isInitialized) store.lock()
@@ -79,138 +66,39 @@ class Actions(
     val unlockBio: () -> Unit,
     val setBio: (Boolean) -> Unit,
     val export: () -> Unit,
-    val pickDatabase: () -> Unit,
+    val pickDatabase: (() -> Unit)?,
     val pickKeyFile: () -> Unit,
+    val saveFile: (String, ByteArray) -> Unit,
+    val pickAttachment: ((String, ByteArray) -> Unit) -> Unit,
+    val autofillEnabled: () -> Boolean,
+    val enableAutofill: () -> Unit,
+    val settings: Settings,
 )
 
-class MainActivity : FragmentActivity() {
-    private val vm: AppVm by viewModels()
-    private lateinit var bio: BioUnlock
-
-    private val exportLauncher = registerForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
-        vm.keepUnlocked = false
-        if (uri != null) {
-            val ok = runCatching { contentResolver.openOutputStream(uri)?.use { vm.store.exportTo(it) } ?: error("") }.isSuccess
-            toast(if (ok) "Backup cifrato salvato" else "Esportazione non riuscita")
-        }
-    }
-    private val dbLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        vm.keepUnlocked = false
-        readSmall(uri, 50_000_000)?.let { vm.pendingImport = it }
-    }
-    private val keyLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        vm.keepUnlocked = false
-        readSmall(uri, 5_000_000)?.let { vm.keyFile = it; vm.keyFileName = displayName(uri!!) }
-    }
+class MainActivity : BaseVaultActivity() {
+    private val handler = Handler(Looper.getMainLooper())
+    private val lockTask = Runnable { vm.lock() }
+    private var stoppedAt = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE) // niente screenshot
-        vm.init(filesDir)
-        bio = BioUnlock(this)
-        vm.bioEnabled = bio.enabled && bio.available()
-        val actions = Actions(
-            copy = ::copySecret,
-            bioAvailable = bio.available(),
-            unlockBio = ::unlockWithBio,
-            setBio = ::setBio,
-            export = {
-                vm.keepUnlocked = true
-                exportLauncher.launch("custode-" + SimpleDateFormat("yyyyMMdd", Locale.US).format(Date()) + ".kdbx")
-            },
-            pickDatabase = { vm.keepUnlocked = true; dbLauncher.launch(arrayOf("*/*")) },
-            pickKeyFile = { vm.keepUnlocked = true; keyLauncher.launch(arrayOf("*/*")) },
-        )
-        setContent { CustodeTheme { App(vm, actions) } }
+        val actions = buildActions(allowImport = true)
+        setContent { CustodeTheme { App(vm, actions) { MainScreen(vm, actions) } } }
     }
 
-    override fun onResume() {
-        super.onResume()
-        if (!vm.unlocked && vm.store.exists && vm.bioEnabled && !vm.autoPrompted && vm.busy == null) {
-            vm.autoPrompted = true
-            unlockWithBio()
-        }
+    override fun onStart() {
+        super.onStart()
+        handler.removeCallbacks(lockTask)
+        // Se il telefono ha "congelato" l'app, il timer può non essere partito: si controlla il tempo trascorso.
+        val d = settings.lockDelaySec
+        if (stoppedAt != 0L && vm.unlocked && d > 0 && SystemClock.elapsedRealtime() - stoppedAt >= d * 1000L) vm.lock()
+        stoppedAt = 0L
     }
 
     override fun onStop() {
         super.onStop()
-        if (!isChangingConfigurations && !vm.keepUnlocked && vm.busy == null) vm.lock() // blocco automatico
-    }
-
-    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
-
-    private fun readSmall(uri: Uri?, max: Int): ByteArray? {
-        if (uri == null) return null
-        return try {
-            val b = contentResolver.openInputStream(uri)!!.use { it.readBytes() }
-            if (b.size > max) { toast("File troppo grande"); null } else b
-        } catch (e: Exception) { toast("File non leggibile"); null }
-    }
-
-    private fun displayName(uri: Uri): String = runCatching {
-        contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
-            if (it.moveToFirst()) it.getString(0) else null
-        }
-    }.getOrNull() ?: "file chiave"
-
-    // ---- Impronta digitale ----
-
-    private fun prompt(title: String, cipher: Cipher, onOk: (Cipher) -> Unit) {
-        val info = BiometricPrompt.PromptInfo.Builder()
-            .setTitle(title)
-            .setNegativeButtonText("Usa la password")
-            .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
-            .build()
-        BiometricPrompt(this, ContextCompat.getMainExecutor(this), object : BiometricPrompt.AuthenticationCallback() {
-            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                result.cryptoObject?.cipher?.let(onOk)
-            }
-            override fun onAuthenticationError(code: Int, msg: CharSequence) {
-                if (code != BiometricPrompt.ERROR_USER_CANCELED && code != BiometricPrompt.ERROR_NEGATIVE_BUTTON &&
-                    code != BiometricPrompt.ERROR_CANCELED) toast(msg.toString())
-            }
-        }).authenticate(info, BiometricPrompt.CryptoObject(cipher))
-    }
-
-    private fun setBio(on: Boolean) {
-        if (!on) { bio.disable(); vm.bioEnabled = false; return }
-        val db = vm.store.db ?: return
-        try {
-            val cipher = bio.encryptCipher()
-            prompt("Attiva lo sblocco con impronta", cipher) { c ->
-                val key = db.compositeKey()
-                try { bio.store(c, key); vm.bioEnabled = true; toast("Sblocco con impronta attivato") }
-                catch (e: Exception) { bio.disable(); toast("Attivazione non riuscita") }
-                finally { key.fill(0) }
-            }
-        } catch (e: Exception) { bio.disable(); toast("Impronta non disponibile su questo telefono") }
-    }
-
-    private fun unlockWithBio() {
-        val cipher = try { bio.decryptCipher() }
-        catch (e: KeyPermanentlyInvalidatedException) {
-            bio.disable(); vm.bioEnabled = false
-            toast("Le impronte sono cambiate: usa la password e riattiva lo sblocco"); return
-        } catch (e: Exception) { toast("Sblocco con impronta non disponibile: usa la password"); return }
-        prompt("Sblocca Custode", cipher) { c ->
-            val key = runCatching { bio.read(c) }.getOrNull()
-            if (key == null) { toast("Sblocco non riuscito: usa la password"); return@prompt }
-            vm.work("Sblocco…", { try { vm.store.openWith(key) } finally { key.fill(0) } }) { vm.unlocked = true; vm.version++ }
-        }
-    }
-
-    // ---- Appunti: contrassegnati come sensibili e cancellati dopo 30 secondi ----
-
-    private fun copySecret(label: String, text: String) {
-        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        val clip = ClipData.newPlainText(label, text).apply {
-            description.extras = PersistableBundle().apply { putBoolean("android.content.extra.IS_SENSITIVE", true) }
-        }
-        cm.setPrimaryClip(clip)
-        Handler(Looper.getMainLooper()).postDelayed({
-            if (cm.primaryClip?.getItemAt(0)?.text?.toString() == text) {
-                if (android.os.Build.VERSION.SDK_INT >= 28) cm.clearPrimaryClip() else cm.setPrimaryClip(ClipData.newPlainText("", ""))
-            }
-        }, 30_000)
+        if (isChangingConfigurations || vm.keepUnlocked || vm.busy != null) return
+        val d = settings.lockDelaySec
+        if (d <= 0) vm.lock() else { stoppedAt = SystemClock.elapsedRealtime(); handler.postDelayed(lockTask, d * 1000L) }
     }
 }

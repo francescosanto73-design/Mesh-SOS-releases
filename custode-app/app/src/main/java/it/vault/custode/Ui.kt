@@ -3,6 +3,7 @@ package it.vault.custode
 import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -10,7 +11,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -24,8 +24,11 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
+import it.vault.custode.kdbx.KdbxDatabase
 import it.vault.custode.kdbx.KdbxEntry
 import it.vault.custode.kdbx.KdbxGroup
+import it.vault.custode.kdbx.Totp
+import kotlinx.coroutines.delay
 
 @Composable
 fun CustodeTheme(content: @Composable () -> Unit) {
@@ -39,16 +42,17 @@ fun CustodeTheme(content: @Composable () -> Unit) {
     MaterialTheme(colorScheme = scheme) { Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { content() } }
 }
 
+/** [unlocked] è la schermata mostrata a database sbloccato (elenco, oppure scelta voce per la compilazione automatica). */
 @Composable
-fun App(vm: AppVm, act: Actions) {
+fun App(vm: AppVm, act: Actions, allowImport: Boolean = true, unlocked: @Composable () -> Unit) {
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(vm.message) { vm.message?.let { snackbar.showSnackbar(it); vm.message = null } }
     Scaffold(snackbarHost = { SnackbarHost(snackbar) }) { pad ->
         Box(Modifier.padding(pad).fillMaxSize()) {
-            if (vm.unlocked) MainScreen(vm, act) else LoginScreen(vm, act)
+            if (vm.unlocked) unlocked() else LoginScreen(vm, act)
         }
     }
-    vm.pendingImport?.let { ImportDialog(vm, act) }
+    if (allowImport) vm.pendingImport?.let { ImportDialog(vm, act) }
     vm.busy?.let { msg ->
         Dialog(onDismissRequest = {}) {
             Surface(shape = RoundedCornerShape(16.dp), tonalElevation = 6.dp) {
@@ -133,8 +137,10 @@ fun LoginScreen(vm: AppVm, act: Actions) {
         if (!creating && vm.bioEnabled) {
             OutlinedButton(onClick = act.unlockBio, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) { Text("Usa l'impronta") }
         }
-        TextButton(onClick = act.pickDatabase, modifier = Modifier.align(Alignment.CenterHorizontally)) {
-            Text(if (creating) "Ho già un database KeePass (.kdbx)" else "Sostituisci con un altro database…")
+        act.pickDatabase?.let { pick ->
+            TextButton(onClick = pick, modifier = Modifier.align(Alignment.CenterHorizontally)) {
+                Text(if (creating) "Ho già un database KeePass (.kdbx)" else "Sostituisci con un altro database…")
+            }
         }
     }
 }
@@ -178,6 +184,22 @@ private fun resolve(root: KdbxGroup, stack: List<String>): KdbxGroup {
     return g
 }
 
+/** Tutti i gruppi (cestino escluso) con il percorso leggibile, per "Sposta in…". */
+private fun groupChoices(db: KdbxDatabase): List<Pair<String, KdbxGroup>> {
+    val bin = db.recycleBin
+    val out = ArrayList<Pair<String, KdbxGroup>>()
+    fun walk(g: KdbxGroup, path: String) {
+        if (bin != null && g.id == bin.id) return
+        out += path to g
+        g.groups.sortedBy { it.name.lowercase() }.forEach { walk(it, "$path / ${it.name}") }
+    }
+    walk(db.root, "Radice")
+    return out
+}
+
+private fun shortDate(iso: String) = iso.replace('T', ' ').removeSuffix("Z").take(16)
+private fun hiddenField(k: String) = k == "otp" || k.startsWith("TimeOtp-")
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(vm: AppVm, act: Actions) {
@@ -185,13 +207,14 @@ fun MainScreen(vm: AppVm, act: Actions) {
     var query by remember { mutableStateOf("") }
     var menu by remember { mutableStateOf(false) }
     var fab by remember { mutableStateOf(false) }
-    var dialog by remember { mutableStateOf<String?>(null) } // "newGroup", "changeKey", "info", "deleteGroup"
+    var dialog by remember { mutableStateOf<String?>(null) }
     var editor by remember { mutableStateOf<String?>(null) }  // "new" oppure UUID della voce
     val stack = vm.groupStack.toList()
     val group = remember(vm.version, stack) { resolve(db.root, stack) }
+    val inBin = remember(vm.version, stack) { db.isInRecycleBin(group) || db.recycleBin?.id == group.id }
     val groups = remember(vm.version, stack) { group.groups.sortedBy { it.name.lowercase() } }
     val entries = remember(vm.version, stack, query) {
-        val src = if (query.isBlank()) group.entries else db.allEntries().filter {
+        val src = if (query.isBlank()) group.entries else db.activeEntries().filter {
             it.title.contains(query, true) || it.username.contains(query, true) || it.url.contains(query, true)
         }
         src.sortedBy { it.title.lowercase() }
@@ -212,14 +235,23 @@ fun MainScreen(vm: AppVm, act: Actions) {
                     IconButton(onClick = { menu = true }, modifier = Modifier.testTag("menu")) { Icon(Icons.Default.MoreVert, "Menu") }
                     DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                         DropdownMenuItem(text = { Text("Esporta backup (.kdbx)") }, onClick = { menu = false; act.export() })
-                        DropdownMenuItem(text = { Text("Apri un altro database…") }, onClick = { menu = false; act.pickDatabase() })
+                        act.pickDatabase?.let { pick -> DropdownMenuItem(text = { Text("Apri un altro database…") }, onClick = { menu = false; pick() }) }
                         DropdownMenuItem(text = { Text("Cambia password principale") }, onClick = { menu = false; dialog = "changeKey" })
                         if (act.bioAvailable) DropdownMenuItem(
                             text = { Text(if (vm.bioEnabled) "Disattiva sblocco con impronta" else "Attiva sblocco con impronta") },
                             onClick = { menu = false; act.setBio(!vm.bioEnabled) },
                         )
-                        if (stack.isNotEmpty()) DropdownMenuItem(
-                            text = { Text("Elimina questo gruppo", color = MaterialTheme.colorScheme.error) },
+                        DropdownMenuItem(
+                            text = { Text(if (act.autofillEnabled()) "Compilazione automatica: attiva ✓" else "Attiva la compilazione automatica") },
+                            onClick = { menu = false; act.enableAutofill() },
+                        )
+                        DropdownMenuItem(text = { Text("Impostazioni") }, onClick = { menu = false; dialog = "settings" })
+                        if (inBin && db.recycleBin?.id == group.id) DropdownMenuItem(
+                            text = { Text("Svuota il cestino", color = MaterialTheme.colorScheme.error) },
+                            onClick = { menu = false; dialog = "emptyBin" },
+                        )
+                        if (stack.isNotEmpty() && db.recycleBin?.id != group.id) DropdownMenuItem(
+                            text = { Text(if (inBin) "Elimina questo gruppo definitivamente" else "Sposta il gruppo nel cestino", color = MaterialTheme.colorScheme.error) },
                             onClick = { menu = false; dialog = "deleteGroup" },
                         )
                         DropdownMenuItem(text = { Text("Informazioni") }, onClick = { menu = false; dialog = "info" })
@@ -228,7 +260,7 @@ fun MainScreen(vm: AppVm, act: Actions) {
             )
         },
         floatingActionButton = {
-            Box {
+            if (!inBin) Box {
                 FloatingActionButton(onClick = { fab = true }, modifier = Modifier.testTag("add")) { Icon(Icons.Default.Add, "Aggiungi") }
                 DropdownMenu(expanded = fab, onDismissRequest = { fab = false }) {
                     DropdownMenuItem(text = { Text("Nuova password") }, onClick = { fab = false; editor = "new" })
@@ -246,7 +278,7 @@ fun MainScreen(vm: AppVm, act: Actions) {
             val showGroups = query.isBlank()
             if ((!showGroups || groups.isEmpty()) && entries.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text(if (query.isBlank()) "Nessuna password qui.\nTocca + per aggiungerne una." else "Nessun risultato")
+                    Text(if (query.isNotBlank()) "Nessun risultato" else if (inBin) "Il cestino è vuoto" else "Nessuna password qui.\nTocca + per aggiungerne una.")
                 }
             } else LazyColumn(Modifier.testTag("list")) {
                 if (showGroups) items(groups, key = { "g" + it.id }) { g ->
@@ -274,18 +306,21 @@ fun MainScreen(vm: AppVm, act: Actions) {
     vm.selectedEntry?.let { id ->
         val e = db.allEntries().firstOrNull { it.id == id }
         if (e == null) vm.selectedEntry = null else DetailDialog(
-            e, act,
+            vm, e, act,
             onEdit = { editor = e.id; vm.selectedEntry = null },
-            onDelete = { db.delete(e); vm.selectedEntry = null; vm.persist() },
             onClose = { vm.selectedEntry = null },
         )
     }
     editor?.let { id ->
+        val existing = if (id == "new") null else db.allEntries().firstOrNull { it.id == id }
         EditorDialog(
-            initial = if (id == "new") null else db.allEntries().firstOrNull { it.id == id },
-            onSave = { t, u, p, url, n ->
-                if (id == "new") group.addEntry(t, u, p, url, n)
-                else db.allEntries().firstOrNull { it.id == id }?.apply { title = t; username = u; password = p; this.url = url; notes = n }
+            initial = existing,
+            onSave = { d ->
+                val e = existing ?: group.addEntry(d.title, d.user, d.password, d.url, d.notes).also { applyExtras(it, d) }
+                if (existing != null) db.edit(e) {
+                    title = d.title; username = d.user; password = d.password; url = d.url; notes = d.notes
+                    applyExtras(this, d)
+                }
                 editor = null; vm.persist()
             },
             onClose = { editor = null },
@@ -295,19 +330,30 @@ fun MainScreen(vm: AppVm, act: Actions) {
         "newGroup" -> TextPrompt("Nuovo gruppo", "Nome del gruppo", onOk = { group.addGroup(it); dialog = null; vm.persist() }, onClose = { dialog = null })
         "deleteGroup" -> AlertDialog(
             onDismissRequest = { dialog = null },
-            title = { Text("Eliminare \"${group.name}\"?") },
-            text = { Text("Verranno eliminate anche le ${group.entriesRecursive().size} voci contenute. L'operazione non è reversibile.") },
+            title = { Text(if (inBin) "Eliminare \"${group.name}\" per sempre?" else "Spostare \"${group.name}\" nel cestino?") },
+            text = { Text("Contiene ${group.entriesRecursive().size} voci." + if (inBin) " L'operazione non è reversibile." else " Potrai ripristinarlo dal cestino.") },
             confirmButton = {
-                TextButton(onClick = { db.delete(group); vm.groupStack.removeAt(vm.groupStack.lastIndex); dialog = null; vm.persist() }) { Text("Elimina") }
+                TextButton(onClick = {
+                    db.trash(group); vm.groupStack.removeAt(vm.groupStack.lastIndex); dialog = null; vm.persist()
+                }) { Text(if (inBin) "Elimina" else "Sposta") }
             },
             dismissButton = { TextButton(onClick = { dialog = null }) { Text("Annulla") } },
         )
+        "emptyBin" -> AlertDialog(
+            onDismissRequest = { dialog = null },
+            title = { Text("Svuotare il cestino?") }, text = { Text("Le voci eliminate non potranno più essere recuperate.") },
+            confirmButton = { TextButton(onClick = { db.emptyRecycleBin(); dialog = null; vm.persist() }) { Text("Svuota") } },
+            dismissButton = { TextButton(onClick = { dialog = null }) { Text("Annulla") } },
+        )
         "changeKey" -> ChangeKeyDialog(vm, act, onClose = { dialog = null })
+        "settings" -> SettingsDialog(act.settings, onClose = { dialog = null })
         "info" -> AlertDialog(
             onDismissRequest = { dialog = null },
-            title = { Text("Custode 1.0") },
+            title = { Text("Custode 1.1") },
             text = {
-                Text("Gestore di password offline, senza accesso a internet.\n\nIl database è un file KDBX 4, lo stesso formato di KeePass, KeePassXC e KeePassDX: puoi esportarlo e aprirlo con quelle app.\n\nLa cifratura usa AES-256 con chiave derivata da Argon2d. Il nucleo del formato è stato scritto da zero e verificato contro KeePassXC; non è stato sottoposto a un audit indipendente.")
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    Text("Gestore di password offline, senza accesso a internet.\n\nIl database è un file KDBX 4, lo stesso formato di KeePass, KeePassXC e KeePassDX: puoi esportarlo e aprirlo con quelle app.\n\nCifratura AES-256 con chiave derivata da Argon2d. Il nucleo del formato è scritto da zero e verificato contro KeePassXC; non ha avuto un audit indipendente.\n\nCompilazione automatica: in Chrome attiva anche Impostazioni di Chrome → Compilazione automatica con un altro servizio.")
+                }
             },
             confirmButton = { TextButton(onClick = { dialog = null }) { Text("Chiudi") } },
         )
@@ -357,12 +403,43 @@ fun ChangeKeyDialog(vm: AppVm, act: Actions, onClose: () -> Unit) {
     )
 }
 
-// ───────────────────────────── Dettaglio e modifica ─────────────────────────────
+@Composable
+fun SettingsDialog(s: Settings, onClose: () -> Unit) {
+    var lock by remember { mutableIntStateOf(s.lockDelaySec) }
+    var clip by remember { mutableIntStateOf(s.clipboardSec) }
+    @Composable fun option(selected: Boolean, label: String, onClick: () -> Unit) {
+        Row(Modifier.fillMaxWidth().clickable(onClick = onClick), verticalAlignment = Alignment.CenterVertically) {
+            RadioButton(selected = selected, onClick = onClick); Text(label)
+        }
+    }
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("Impostazioni") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                Text("Blocca quando esco dall'app", style = MaterialTheme.typography.titleSmall)
+                Settings.LOCK_OPTIONS.forEach { (v, l) -> option(lock == v, l) { lock = v; s.lockDelaySec = v } }
+                Spacer(Modifier.height(12.dp))
+                Text("Cancella gli appunti dopo", style = MaterialTheme.typography.titleSmall)
+                Settings.CLIP_OPTIONS.forEach { (v, l) -> option(clip == v, l) { clip = v; s.clipboardSec = v } }
+            }
+        },
+        confirmButton = { TextButton(onClick = onClose) { Text("Fatto") } },
+    )
+}
+
+// ───────────────────────────── Dettaglio ─────────────────────────────
 
 @Composable
-fun DetailDialog(e: KdbxEntry, act: Actions, onEdit: () -> Unit, onDelete: () -> Unit, onClose: () -> Unit) {
+fun DetailDialog(vm: AppVm, e: KdbxEntry, act: Actions, onEdit: () -> Unit, onClose: () -> Unit) {
+    val db = vm.store.db ?: return
     var show by remember { mutableStateOf(false) }
     var confirm by remember { mutableStateOf(false) }
+    var sub by remember { mutableStateOf<String?>(null) } // "history" | "move"
+    val inBin = remember(vm.version) { db.isInRecycleBin(e) }
+    val totp = remember(vm.version, e.id) { Totp.of(e) }
+    val rawOtp = e.field("otp")
+
     AlertDialog(
         onDismissRequest = onClose,
         title = { Text(e.title.ifBlank { "(senza nome)" }) },
@@ -374,39 +451,154 @@ fun DetailDialog(e: KdbxEntry, act: Actions, onEdit: () -> Unit, onDelete: () ->
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Password: " + if (show) e.password else "••••••••", Modifier.weight(1f))
-                    IconButton(onClick = { show = !show }) {
-                        Icon(if (show) CIcons.VisibilityOff else CIcons.Visibility, "Mostra o nascondi")
-                    }
+                    IconButton(onClick = { show = !show }) { Icon(if (show) CIcons.VisibilityOff else CIcons.Visibility, "Mostra o nascondi") }
                     IconButton(onClick = { act.copy("password", e.password) }) { Icon(CIcons.Copy, "Copia password") }
                 }
+                if (totp != null) TotpRow(totp, act)
+                else if (rawOtp.isNotBlank()) Text("Codice a due fattori non riconosciuto (formato non supportato)", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
                 if (e.url.isNotBlank()) Text("Sito: ${e.url}", Modifier.padding(top = 4.dp))
-                e.customFields.forEach { (k, v) -> Text("$k: $v", Modifier.padding(top = 4.dp)) }
+                e.customFields.filterKeys { !hiddenField(it) }.forEach { (k, v) ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("$k: " + if (e.isProtected(k) && !show) "••••••••" else v, Modifier.weight(1f))
+                        IconButton(onClick = { act.copy(k, v) }) { Icon(CIcons.Copy, "Copia $k") }
+                    }
+                }
                 if (e.notes.isNotBlank()) Text("Note: ${e.notes}", Modifier.padding(top = 8.dp))
+
+                // Allegati
+                e.attachments.forEach { name ->
+                    val data = db.attachmentBytes(e, name)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("📎 $name (${(data?.size ?: 0) / 1024 + 1} KB)", Modifier.weight(1f))
+                        TextButton(onClick = { data?.let { act.saveFile(name, it) } }) { Text("Salva") }
+                        TextButton(onClick = { db.removeAttachment(e, name); vm.persist() }) { Text("Togli") }
+                    }
+                }
+                Row {
+                    if (!inBin) TextButton(onClick = {
+                        act.pickAttachment { name, bytes -> db.addAttachment(e, name, bytes); vm.persist() }
+                    }) { Text("Allega file") }
+                    if (e.history.isNotEmpty()) TextButton(onClick = { sub = "history" }) { Text("Storico (${e.history.size})") }
+                    TextButton(onClick = { sub = "move" }) { Text(if (inBin) "Ripristina in…" else "Sposta…") }
+                }
             }
         },
-        confirmButton = { TextButton(onClick = onEdit) { Text("Modifica") } },
+        confirmButton = { if (!inBin) TextButton(onClick = onEdit) { Text("Modifica") } else TextButton(onClick = { db.restore(e); vm.persist(); vm.message = "Voce ripristinata"; onClose() }) { Text("Ripristina") } },
         dismissButton = {
             Row {
-                TextButton(onClick = { confirm = true }) { Text("Elimina", color = MaterialTheme.colorScheme.error) }
+                TextButton(onClick = { confirm = true }) { Text(if (inBin) "Elimina" else "Cestino", color = MaterialTheme.colorScheme.error) }
                 TextButton(onClick = onClose) { Text("Chiudi") }
             }
         },
     )
     if (confirm) AlertDialog(
         onDismissRequest = { confirm = false },
-        title = { Text("Eliminare \"${e.title}\"?") }, text = { Text("L'operazione non è reversibile.") },
-        confirmButton = { TextButton(onClick = onDelete) { Text("Elimina") } },
+        title = { Text(if (inBin) "Eliminare \"${e.title}\" per sempre?" else "Spostare \"${e.title}\" nel cestino?") },
+        text = { Text(if (inBin) "L'operazione non è reversibile." else "Potrai ripristinarla dal cestino.") },
+        confirmButton = {
+            TextButton(onClick = {
+                db.trash(e); confirm = false; onClose(); vm.persist()
+                vm.message = if (inBin) "Eliminata definitivamente" else "Spostata nel cestino"
+            }) { Text(if (inBin) "Elimina" else "Sposta") }
+        },
         dismissButton = { TextButton(onClick = { confirm = false }) { Text("Annulla") } },
     )
+    when (sub) {
+        "history" -> HistoryDialog(vm, e, onClose = { sub = null })
+        "move" -> AlertDialog(
+            onDismissRequest = { sub = null },
+            title = { Text(if (inBin) "Ripristina in…" else "Sposta in…") },
+            text = {
+                LazyColumn { items(groupChoices(db), key = { it.second.id }) { (path, g) ->
+                    Text(path, Modifier.fillMaxWidth().clickable {
+                        db.move(e, g); sub = null; onClose(); vm.persist()
+                    }.padding(vertical = 12.dp))
+                } }
+            },
+            confirmButton = {}, dismissButton = { TextButton(onClick = { sub = null }) { Text("Annulla") } },
+        )
+    }
 }
 
 @Composable
-fun EditorDialog(initial: KdbxEntry?, onSave: (String, String, String, String, String) -> Unit, onClose: () -> Unit) {
+fun TotpRow(spec: it.vault.custode.kdbx.TotpSpec, act: Actions) {
+    var now by remember { mutableLongStateOf(System.currentTimeMillis() / 1000) }
+    LaunchedEffect(Unit) { while (true) { delay(1000); now = System.currentTimeMillis() / 1000 } }
+    val code = Totp.code(spec, now); val left = Totp.secondsLeft(spec, now)
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("Codice: ${code.chunked((code.length + 1) / 2).joinToString(" ")}  (${left}s)", Modifier.weight(1f).testTag("totp"))
+        IconButton(onClick = { act.copy("codice", code) }) { Icon(CIcons.Copy, "Copia codice") }
+    }
+}
+
+@Composable
+fun HistoryDialog(vm: AppVm, e: KdbxEntry, onClose: () -> Unit) {
+    val db = vm.store.db ?: return
+    var show by remember { mutableStateOf(false) }
+    val versions = remember(vm.version) { e.history.reversed() }
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("Storico di \"${e.title}\"") },
+        text = {
+            LazyColumn {
+                item {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Switch(checked = show, onCheckedChange = { show = it }); Spacer(Modifier.width(8.dp)); Text("Mostra le password")
+                    }
+                }
+                items(versions) { v ->
+                    Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                        Text(shortDate(v.modified), style = MaterialTheme.typography.labelLarge)
+                        Text("Utente: ${v.username}")
+                        Text("Password: " + if (show) v.password else "••••••••")
+                        TextButton(onClick = { db.restoreVersion(e, v); vm.persist(); vm.message = "Versione ripristinata"; onClose() }) { Text("Ripristina questa versione") }
+                    }
+                    HorizontalDivider()
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onClose) { Text("Chiudi") } },
+    )
+}
+
+// ───────────────────────────── Modifica ─────────────────────────────
+
+class EditorData(
+    val title: String, val user: String, val password: String, val url: String, val notes: String,
+    val custom: List<Triple<String, String, Boolean>>, val totp: String,
+)
+
+/** Campi personalizzati e TOTP (la parte comune a nuove voci e modifiche). */
+private fun applyExtras(e: KdbxEntry, d: EditorData) {
+    val keep = d.custom.map { it.first }.toSet()
+    e.customFields.keys.filter { !hiddenField(it) && it !in keep }.forEach { e.removeField(it) }
+    d.custom.forEach { (k, v, p) -> e.setField(k, v, protect = p) }
+    val t = d.totp.trim()
+    if (t.isEmpty()) e.removeField("otp") else e.setField("otp", t, protect = true)
+}
+
+/** Converte quanto scritto nel campo TOTP: otpauth:// o key=… restano così; un segreto base32 diventa un otpauth://. */
+private fun normalizeTotp(raw: String, title: String, user: String): String? {
+    val t = raw.trim()
+    if (t.isEmpty()) return ""
+    if (Totp.parse(t) != null) return t
+    return Totp.uri(t, title.ifBlank { "Custode" }, user)?.takeIf { Totp.parse(it) != null }
+}
+
+@Composable
+fun EditorDialog(initial: KdbxEntry?, onSave: (EditorData) -> Unit, onClose: () -> Unit) {
     var title by remember { mutableStateOf(initial?.title ?: "") }
     var user by remember { mutableStateOf(initial?.username ?: "") }
     var pw by remember { mutableStateOf(initial?.password ?: "") }
     var url by remember { mutableStateOf(initial?.url ?: "") }
     var notes by remember { mutableStateOf(initial?.notes ?: "") }
+    var totp by remember { mutableStateOf(initial?.field("otp") ?: "") }
+    var totpError by remember { mutableStateOf(false) }
+    val custom = remember {
+        mutableStateListOf<Triple<String, String, Boolean>>().apply {
+            initial?.customFields?.filterKeys { !hiddenField(it) }?.forEach { (k, v) -> add(Triple(k, v, initial.isProtected(k))) }
+        }
+    }
     var visible by remember { mutableStateOf(initial == null) }
     var length by remember { mutableFloatStateOf(20f) }
     var symbols by remember { mutableStateOf(true) }
@@ -423,9 +615,7 @@ fun EditorDialog(initial: KdbxEntry?, onSave: (String, String, String, String, S
                     pw, { pw = it }, label = { Text("Password") }, singleLine = true, modifier = Modifier.testTag("password"),
                     visualTransformation = if (visible) VisualTransformation.None else PasswordVisualTransformation(),
                     trailingIcon = {
-                        IconButton(onClick = { visible = !visible }) {
-                            Icon(if (visible) CIcons.VisibilityOff else CIcons.Visibility, "Mostra o nascondi")
-                        }
+                        IconButton(onClick = { visible = !visible }) { Icon(if (visible) CIcons.VisibilityOff else CIcons.Visibility, "Mostra o nascondi") }
                     },
                 )
                 Text("Generatore: ${length.toInt()} caratteri, ~${PasswordGenerator.entropyBits(opts)} bit", style = MaterialTheme.typography.bodySmall)
@@ -436,11 +626,36 @@ fun EditorDialog(initial: KdbxEntry?, onSave: (String, String, String, String, S
                     TextButton(onClick = { pw = PasswordGenerator.generate(opts); visible = true }, modifier = Modifier.testTag("generate")) { Text("Genera") }
                 }
                 OutlinedTextField(url, { url = it }, label = { Text("Sito web") }, singleLine = true)
+                OutlinedTextField(
+                    totp, { totp = it; totpError = false }, label = { Text("Codice a due fattori (segreto o link otpauth://)") },
+                    singleLine = true, isError = totpError, modifier = Modifier.testTag("totpField"),
+                    supportingText = { if (totpError) Text("Formato non valido: serve il segreto base32 o un link otpauth://totp/…") },
+                )
                 OutlinedTextField(notes, { notes = it }, label = { Text("Note") }, minLines = 2)
+                custom.forEachIndexed { i, (k, v, p) ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            OutlinedTextField(k, { custom[i] = Triple(it, v, p) }, label = { Text("Nome campo") }, singleLine = true)
+                            OutlinedTextField(v, { custom[i] = Triple(k, it, p) }, label = { Text("Valore") }, singleLine = true,
+                                visualTransformation = if (p) PasswordVisualTransformation() else VisualTransformation.None)
+                        }
+                        Column {
+                            Switch(checked = p, onCheckedChange = { custom[i] = Triple(k, v, it) })
+                            Text("Segreto", style = MaterialTheme.typography.labelSmall)
+                            TextButton(onClick = { custom.removeAt(i) }) { Text("Togli") }
+                        }
+                    }
+                }
+                TextButton(onClick = { custom.add(Triple("", "", false)) }) { Text("Aggiungi campo personalizzato") }
             }
         },
         confirmButton = {
-            TextButton(enabled = title.isNotBlank(), modifier = Modifier.testTag("save"), onClick = { onSave(title.trim(), user.trim(), pw, url.trim(), notes) }) { Text("Salva") }
+            TextButton(enabled = title.isNotBlank(), modifier = Modifier.testTag("save"), onClick = {
+                val t = normalizeTotp(totp, title, user)
+                if (t == null) { totpError = true; return@TextButton }
+                val fields = custom.filter { it.first.isNotBlank() && it.first !in setOf("Title", "UserName", "Password", "URL", "Notes") && !hiddenField(it.first) }
+                onSave(EditorData(title.trim(), user.trim(), pw, url.trim(), notes, fields, t))
+            }) { Text("Salva") }
         },
         dismissButton = { TextButton(onClick = onClose) { Text("Annulla") } },
     )
