@@ -53,7 +53,6 @@ class AutofillActivityTest {
         rule.onNodeWithText("Corrispondenti").assertIsDisplayed()          // la voce giusta è proposta per prima
         rule.onNodeWithTag("row-Banca").performClick()
 
-        wait { scenario.state == androidx.lifecycle.Lifecycle.State.DESTROYED }
         val result = scenario.result
         assertEquals(Activity.RESULT_OK, result.resultCode)
         val ds = result.resultData.getParcelableExtra<Dataset>(AutofillManager.EXTRA_AUTHENTICATION_RESULT)
@@ -81,7 +80,6 @@ class AutofillActivityTest {
         rule.onNodeWithTag("submit").performClick()
         wait { rule.onAllNodesWithTag("save").fetchSemanticsNodes().isNotEmpty() }
         rule.onNodeWithTag("save").performClick()
-        wait { scenario.state == androidx.lifecycle.Lifecycle.State.DESTROYED }
         assertEquals(Activity.RESULT_OK, scenario.result.resultCode)
         store.open("pw-autofill-2".toCharArray(), null)
         val e = store.db!!.allEntries().single()
