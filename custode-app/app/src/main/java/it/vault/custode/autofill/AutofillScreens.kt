@@ -31,23 +31,25 @@ fun ChooseScreen(vm: AppVm, label: String, pkg: String, web: String?, onPick: (K
     Scaffold(topBar = {
         TopAppBar(title = { Text("Compila: $label", maxLines = 1) }, actions = { TextButton(onClick = onCancel) { Text("Annulla") } })
     }) { pad ->
-        LazyColumn(Modifier.padding(pad).testTag("choose")) {
-            if (matching.isNotEmpty()) {
-                item { Text("Corrispondenti", Modifier.padding(16.dp, 12.dp, 16.dp, 4.dp), style = MaterialTheme.typography.labelLarge) }
-                items(matching, key = { "m" + it.id }) { EntryRow(it, onPick) }
-            } else {
-                item {
-                    Text("Nessuna voce corrisponde a $label. Scegline una a mano: controlla che sia quella giusta prima di compilare.",
-                        Modifier.padding(16.dp), style = MaterialTheme.typography.bodyMedium)
+        Column(Modifier.padding(pad)) {
+            // Il campo di ricerca sta fuori dalla lista (come nella schermata principale).
+            OutlinedTextField(
+                value = query, onValueChange = { query = it }, singleLine = true, placeholder = { Text("Cerca tra tutte le voci") },
+                modifier = Modifier.fillMaxWidth().padding(16.dp, 8.dp),
+            )
+            LazyColumn(Modifier.testTag("choose")) {
+                if (matching.isNotEmpty()) {
+                    item { Text("Corrispondenti", Modifier.padding(16.dp, 12.dp, 16.dp, 4.dp), style = MaterialTheme.typography.labelLarge) }
+                    items(matching, key = { "m" + it.id }) { EntryRow(it, onPick) }
+                } else {
+                    item {
+                        Text("Nessuna voce corrisponde a $label. Scegline una a mano: controlla che sia quella giusta prima di compilare.",
+                            Modifier.padding(16.dp), style = MaterialTheme.typography.bodyMedium)
+                    }
                 }
+                if (others.isNotEmpty()) item { Text("Altre voci", Modifier.padding(16.dp, 12.dp, 16.dp, 4.dp), style = MaterialTheme.typography.labelLarge) }
+                items(others, key = { "o" + it.id }) { EntryRow(it, onPick) }
             }
-            item {
-                OutlinedTextField(
-                    value = query, onValueChange = { query = it }, singleLine = true, placeholder = { Text("Cerca tra tutte le voci") },
-                    modifier = Modifier.fillMaxWidth().padding(16.dp, 8.dp),
-                )
-            }
-            items(others, key = { "o" + it.id }) { EntryRow(it, onPick) }
         }
     }
 }
