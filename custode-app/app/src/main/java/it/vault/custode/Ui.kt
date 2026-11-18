@@ -373,7 +373,7 @@ fun MainScreen(vm: AppVm, act: Actions) {
         "settings" -> SettingsDialog(act.settings, onClose = { dialog = null })
         "info" -> AlertDialog(
             onDismissRequest = { dialog = null },
-            title = { Text("Custode 1.1") },
+            title = { Text("Custode 1.2") },
             text = {
                 Column(Modifier.verticalScroll(rememberScrollState())) {
                     Text("Gestore di password offline, senza accesso a internet.\n\nIl database è un file KDBX 4, lo stesso formato di KeePass, KeePassXC e KeePassDX: puoi esportarlo e aprirlo con quelle app.\n\nCifratura AES-256 con chiave derivata da Argon2d. Il nucleo del formato è scritto da zero e verificato contro KeePassXC; non ha avuto un audit indipendente.\n\nCompilazione automatica: in Chrome attiva anche Impostazioni di Chrome → Compilazione automatica con un altro servizio.")
