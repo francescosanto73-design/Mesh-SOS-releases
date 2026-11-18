@@ -15,3 +15,8 @@ poi copia `app-debug.apk` sul telefono e installalo (consenti "origini sconosciu
 In alternativa apri la cartella in Android Studio e premi Run.
 
 Attenzione: se dimentichi la password principale i dati non sono recuperabili.
+
+## Custode (fork di KeePassDX)
+La cartella [`custode-kdx/`](custode-kdx/) contiene una versione di **KeePassDX 4.5.8** con nome e icona propri,
+compilata da GitHub Actions ("Build Custode") a partire dal codice sorgente. Licenza GPL-3, vedi `custode-kdx/NOTICE.md`.
+Formato database: KeePass (KDBX), compatibile con KeePassXC, KeePassDX e altri.
