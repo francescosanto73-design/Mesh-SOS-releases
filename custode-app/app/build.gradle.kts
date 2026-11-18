@@ -52,6 +52,7 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.activity:activity-compose:1.9.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.3")
+    implementation("androidx.fragment:fragment:1.6.2") // il default di biometric è troppo vecchio per le API ActivityResult
     implementation("androidx.biometric:biometric:1.1.0")
     implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
 
