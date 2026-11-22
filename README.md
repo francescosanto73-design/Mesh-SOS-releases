@@ -20,3 +20,6 @@ Attenzione: se dimentichi la password principale i dati non sono recuperabili.
 La cartella [`custode-kdx/`](custode-kdx/) contiene una versione di **KeePassDX 4.5.8** con nome e icona propri,
 compilata da GitHub Actions ("Build Custode") a partire dal codice sorgente. Licenza GPL-3, vedi `custode-kdx/NOTICE.md`.
 Formato database: KeePass (KDBX), compatibile con KeePassXC, KeePassDX e altri.
+
+## TV Guida (`tv-guida/`)
+App Android che mostra cosa c'è in TV (guida XMLTV italiana, canali Sky inclusi) e, toccando un programma, cambia canale sul box Sky Stream: il telefono si associa al box come tastiera Bluetooth (HID) e digita il numero del canale. I numeri predefiniti sono solo indicativi: si correggono dall'app. APK da GitHub Actions ("Build TV Guida").
