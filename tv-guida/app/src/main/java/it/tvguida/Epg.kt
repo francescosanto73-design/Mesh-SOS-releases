@@ -34,10 +34,10 @@ object Epg {
         return cache
     }
 
-    /** Legge solo i programmi tra (adesso - 3h) e (adesso + 72h) per contenere la memoria. */
+    /** Legge solo i programmi tra (adesso - 3h) e (adesso + 36h) per contenere la memoria. */
     fun parse(file: File, now: Long = System.currentTimeMillis()): List<Channel> {
         val from = now - 3 * 3600_000L
-        val to = now + 72 * 3600_000L
+        val to = now + 36 * 3600_000L
         val fmt = SimpleDateFormat("yyyyMMddHHmmss Z", Locale.US)
 
         val names = LinkedHashMap<String, String>()

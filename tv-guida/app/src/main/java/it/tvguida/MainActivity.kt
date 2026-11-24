@@ -78,16 +78,7 @@ class MainActivity : ComponentActivity() {
                     .filter { query.isBlank() || it.name.contains(query, true) || it.now(now)?.title?.contains(query, true) == true }
                     .sortedWith(compareBy({ numbers.get(it.id) ?: Int.MAX_VALUE }, { it.name }))
 
-                val sel = selected
-                if (sel != null) {
-                    ScheduleScreen(
-                        channel = sel,
-                        number = numbers.get(sel.id),
-                        onBack = { selected = null },
-                        onSaveNumber = { numbers.set(sel.id, it); tick++ },
-                        onGo = { n -> scope.launch { if (!remote.goToChannel(n)) remoteState = "Box non collegato: usa «Collega box»" } },
-                    )
-                } else Scaffold(topBar = {
+                Scaffold(topBar = {
                     TopAppBar(
                         title = { Text("In TV ora") },
                         actions = {
@@ -123,6 +114,39 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     }
+                }
+
+                selected?.let { ch ->
+                    var text by remember(ch.id) { mutableStateOf(numbers.get(ch.id)?.toString() ?: "") }
+                    val cur = ch.now(now)
+                    AlertDialog(
+                        onDismissRequest = { selected = null },
+                        title = { Text(ch.name) },
+                        text = {
+                            Column {
+                                Text(cur?.title ?: "", fontWeight = FontWeight.SemiBold)
+                                if (!cur?.desc.isNullOrBlank()) Text(cur!!.desc, maxLines = 6, overflow = TextOverflow.Ellipsis)
+                                Spacer(Modifier.height(12.dp))
+                                OutlinedTextField(
+                                    value = text, onValueChange = { text = it.filter(Char::isDigit).take(4) },
+                                    label = { Text("Numero canale sul box") }, singleLine = true,
+                                )
+                            }
+                        },
+                        confirmButton = {
+                            Button(onClick = {
+                                val n = text.toIntOrNull()
+                                numbers.set(ch.id, n); tick++
+                                selected = null
+                                if (n != null) scope.launch {
+                                    if (!remote.goToChannel(n)) remoteState = "Box non collegato: usa «Collega box»"
+                                }
+                            }, enabled = text.isNotBlank()) { Text("Vai al canale") }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { numbers.set(ch.id, text.toIntOrNull()); tick++; selected = null }) { Text("Salva numero") }
+                        },
+                    )
                 }
 
                 if (showDevices) {
