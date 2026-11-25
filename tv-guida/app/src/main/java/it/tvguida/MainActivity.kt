@@ -1,13 +1,8 @@
 package it.tvguida
 
-import android.Manifest
-import android.annotation.SuppressLint
-import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -30,14 +25,13 @@ import java.util.Date
 import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
-@SuppressLint("MissingPermission")
 class MainActivity : ComponentActivity() {
-    private lateinit var remote: SkyRemote
-    private var remoteState by mutableStateOf("Non collegato")
+    private lateinit var remote: BroadlinkRemote
+    private var remoteState by mutableStateOf("Broadlink non configurato")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        remote = SkyRemote(this) { remoteState = it }
+        remote = BroadlinkRemote(this) { remoteState = it }
         val numbers = Numbers(this)
         val cache = File(cacheDir, "epg.xml.gz")
 
@@ -49,7 +43,7 @@ class MainActivity : ComponentActivity() {
                 var error by remember { mutableStateOf<String?>(null) }
                 var query by remember { mutableStateOf("") }
                 var selected by remember { mutableStateOf<Channel?>(null) }
-                var showDevices by remember { mutableStateOf(false) }
+                var showRemote by remember { mutableStateOf(false) }
                 var tick by remember { mutableStateOf(0) } // forza il ricalcolo dei numeri
 
                 fun load(force: Boolean) = scope.launch {
@@ -68,10 +62,6 @@ class MainActivity : ComponentActivity() {
                     loading = false
                 }
 
-                val permission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
-                    if (ok) { remote.start(); showDevices = true } else remoteState = "Permesso Bluetooth negato"
-                }
-
                 LaunchedEffect(Unit) { load(false) }
 
                 val now = System.currentTimeMillis()
@@ -83,10 +73,7 @@ class MainActivity : ComponentActivity() {
                     TopAppBar(
                         title = { Text("In TV ora") },
                         actions = {
-                            TextButton(onClick = {
-                                if (Build.VERSION.SDK_INT >= 31) permission.launch(Manifest.permission.BLUETOOTH_CONNECT)
-                                else { remote.start(); showDevices = true }
-                            }) { Text(if (remote.connected) "Box ✓" else "Collega box") }
+                            TextButton(onClick = { showRemote = true }) { Text(if (remote.configured) "Telecomando ✓" else "Telecomando") }
                             IconButton(onClick = { load(true) }) { Icon(Icons.Default.Refresh, "Aggiorna") }
                         },
                     )
@@ -140,7 +127,7 @@ class MainActivity : ComponentActivity() {
                                 numbers.set(ch.id, n); tick++
                                 selected = null
                                 if (n != null) scope.launch {
-                                    if (!remote.goToChannel(n)) remoteState = "Box non collegato: usa «Collega box»"
+                                    remote.goToChannel(n)
                                 }
                             }, enabled = text.isNotBlank()) { Text("Vai al canale") }
                         },
@@ -150,28 +137,47 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
-                if (showDevices) {
+                if (showRemote) {
+                    var ip by remember { mutableStateOf(remote.host ?: "") }
+                    var test by remember { mutableStateOf("") }
+                    var busy by remember { mutableStateOf(false) }
+                    var learned by remember { mutableStateOf(remote.learnedCount) }
                     AlertDialog(
-                        onDismissRequest = { showDevices = false },
-                        title = { Text("Scegli il box Sky") },
+                        onDismissRequest = { if (!busy) showRemote = false },
+                        title = { Text("Telecomando Broadlink") },
                         text = {
                             Column {
-                                Text("Prima associa il telefono al box: sul Sky Stream apri Impostazioni › Bluetooth e cerca questo telefono. Poi tocca qui il box.", style = MaterialTheme.typography.bodySmall)
-                                Spacer(Modifier.height(8.dp))
-                                remote.bondedDevices().forEach { d ->
-                                    TextButton(onClick = { remote.connect(d); showDevices = false }) { Text(d.name ?: d.address) }
+                                Text("Il telefono deve essere sullo stesso Wi-Fi del Broadlink.", style = MaterialTheme.typography.bodySmall)
+                                OutlinedTextField(value = ip, onValueChange = { ip = it.trim() }, singleLine = true,
+                                    label = { Text("IP Broadlink (vuoto = cerca)") }, modifier = Modifier.fillMaxWidth())
+                                Button(enabled = !busy, onClick = { scope.launch { busy = true; remote.find(ip); ip = remote.host ?: ip; busy = false } }) {
+                                    Text("Cerca / collega")
                                 }
-                                TextButton(onClick = { remote.start(); remote.adapter?.let { startActivity(android.content.Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS)) } }) { Text("Impostazioni Bluetooth") }
+                                Spacer(Modifier.height(8.dp))
+                                Text("Tasti imparati: $learned/10. Tocca una cifra, poi punta il telecomando Sky verso il Broadlink e premi quel tasto.", style = MaterialTheme.typography.bodySmall)
+                                for (row in listOf(0..4, 5..9)) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    for (d in row) OutlinedButton(
+                                        enabled = !busy && remote.configured,
+                                        onClick = { scope.launch { busy = true; remote.learn(d); learned = remote.learnedCount; busy = false } },
+                                        contentPadding = PaddingValues(0.dp), modifier = Modifier.weight(1f),
+                                    ) { Text(if (remote.hasCode(d)) "$d ✓" else "$d") }
+                                }
+                                Spacer(Modifier.height(8.dp))
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    OutlinedTextField(value = test, onValueChange = { test = it.filter(Char::isDigit).take(4) },
+                                        label = { Text("Prova canale") }, singleLine = true, modifier = Modifier.weight(1f))
+                                    Button(enabled = !busy && test.isNotBlank(),
+                                        onClick = { scope.launch { busy = true; remote.goToChannel(test.toInt()); busy = false } }) { Text("Invia") }
+                                }
+                                Text(remoteState, style = MaterialTheme.typography.labelMedium, modifier = Modifier.padding(top = 8.dp))
                             }
                         },
-                        confirmButton = { TextButton(onClick = { showDevices = false }) { Text("Chiudi") } },
+                        confirmButton = { TextButton(enabled = !busy, onClick = { showRemote = false }) { Text("Chiudi") } },
                     )
                 }
             }
         }
     }
-
-    override fun onDestroy() { remote.stop(); super.onDestroy() }
 
     private fun hm(t: Long) = SimpleDateFormat("HH:mm", Locale.ITALY).format(Date(t))
 }
