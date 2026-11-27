@@ -23,3 +23,5 @@ Formato database: KeePass (KDBX), compatibile con KeePassXC, KeePassDX e altri.
 
 ## TV Guida (`tv-guida/`)
 App Android che mostra cosa c'è in TV (guida XMLTV italiana, canali Sky inclusi) e, toccando un programma, cambia canale sul box Sky Stream tramite un Broadlink RM (IR via Wi-Fi): dal pulsante «Telecomando» si trova il Broadlink e si "imparano" i tasti 0-9 dal telecomando Sky; poi l'app digita il numero del canale. I numeri predefiniti dei canali sono solo indicativi: si correggono dall'app. APK da GitHub Actions ("Build TV Guida").
+
+L'app include anche un **assistente vocale** (pulsante microfono): usa l'API di Claude (serve una chiave API di Anthropic, inserita nelle impostazioni dell'assistente e salvata solo sul telefono) e può cercare nella guida TV, cambiare canale, premere tasti IR imparati, impostare timer/sveglie e gestire la lista della spesa.

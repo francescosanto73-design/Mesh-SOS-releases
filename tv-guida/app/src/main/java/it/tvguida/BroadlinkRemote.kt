@@ -30,7 +30,10 @@ class BroadlinkRemote(ctx: Context, private val onState: (String) -> Unit) {
     private var authed = false
 
     val configured get() = host != null && mac != null
-    fun hasCode(d: Int) = prefs.contains("k$d")
+    fun hasCode(d: Int) = hasKey(d.toString())
+    fun hasKey(name: String) = prefs.contains("k$name")
+    /** Nomi di tutti i tasti imparati (cifre comprese). */
+    fun learnedKeys(): List<String> = prefs.all.keys.filter { it.length > 1 && it.startsWith("k") }.map { it.drop(1) }.sorted()
     val learnedCount get() = (0..9).count { hasCode(it) }
 
     // ---------- configurazione ----------
@@ -64,10 +67,12 @@ class BroadlinkRemote(ctx: Context, private val onState: (String) -> Unit) {
     }
 
     /** Entra in modalità apprendimento e aspetta fino a 30 s che si prema un tasto sul telecomando. */
-    suspend fun learn(digit: Int): Boolean = withContext(Dispatchers.IO) {
+    suspend fun learn(digit: Int): Boolean = learnKey(digit.toString())
+
+    suspend fun learnKey(name: String): Boolean = withContext(Dispatchers.IO) {
         try {
             ensureAuth()
-            onState("Punta il telecomando Sky verso il Broadlink e premi il tasto $digit…")
+            onState("Punta il telecomando Sky verso il Broadlink e premi il tasto $name…")
             cmd(0x03)
             var code: ByteArray? = null
             val end = System.currentTimeMillis() + 30_000
@@ -75,9 +80,9 @@ class BroadlinkRemote(ctx: Context, private val onState: (String) -> Unit) {
                 delay(1000)
                 code = try { cmd(0x04).takeIf { it.size > 4 } } catch (_: Exception) { null }
             }
-            if (code == null) { onState("Nessun segnale ricevuto per il tasto $digit"); return@withContext false }
-            prefs.edit().putString("k$digit", hex(trim(code))).apply()
-            onState("Tasto $digit salvato (${learnedCount}/10)")
+            if (code == null) { onState("Nessun segnale ricevuto per il tasto $name"); return@withContext false }
+            prefs.edit().putString("k$name", hex(trim(code))).apply()
+            onState("Tasto $name salvato (${learnedCount}/10)")
             true
         } catch (e: Exception) {
             authed = false
@@ -95,7 +100,7 @@ class BroadlinkRemote(ctx: Context, private val onState: (String) -> Unit) {
         val missing = digits.firstOrNull { !hasCode(it) }
         if (missing != null) { onState("Manca il tasto $missing: impara i tasti da «Telecomando»"); return false }
         return try {
-            for (d in digits) { sendDigit(d); delay(450) }
+            for (d in digits) { sendKey(d.toString()); delay(450) }
             onState("Inviato canale $number")
             true
         } catch (e: Exception) {
@@ -104,8 +109,9 @@ class BroadlinkRemote(ctx: Context, private val onState: (String) -> Unit) {
         }
     }
 
-    private suspend fun sendDigit(d: Int) = withContext(Dispatchers.IO) {
-        val code = unhex(prefs.getString("k$d", null)!!)
+    /** Invia il codice IR di un tasto già imparato. */
+    suspend fun sendKey(name: String) = withContext(Dispatchers.IO) {
+        val code = unhex(prefs.getString("k$name", null) ?: error("Tasto «$name» non imparato"))
         try { ensureAuth(); cmd(0x02, code) }
         catch (e: Exception) { authed = false; ensureAuth(); cmd(0x02, code) } // un secondo tentativo con nuova autenticazione
     }

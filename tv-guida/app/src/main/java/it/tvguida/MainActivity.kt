@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -27,11 +28,14 @@ import java.util.Locale
 @OptIn(ExperimentalMaterial3Api::class)
 class MainActivity : ComponentActivity() {
     private lateinit var remote: BroadlinkRemote
+    private lateinit var voice: Voice
     private var remoteState by mutableStateOf("Broadlink non configurato")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         remote = BroadlinkRemote(this) { remoteState = it }
+        voice = Voice(this)
+        val assistantSettings = AssistantSettings(this)
         val numbers = Numbers(this)
         val cache = File(cacheDir, "epg.xml.gz")
 
@@ -43,8 +47,13 @@ class MainActivity : ComponentActivity() {
                 var error by remember { mutableStateOf<String?>(null) }
                 var query by remember { mutableStateOf("") }
                 var selected by remember { mutableStateOf<Channel?>(null) }
+                var showAssistant by remember { mutableStateOf(false) }
                 var showRemote by remember { mutableStateOf(false) }
                 var tick by remember { mutableStateOf(0) } // forza il ricalcolo dei numeri
+
+                val channelsRef = rememberUpdatedState(channels)
+                val tools = remember { AssistantTools(this@MainActivity, numbers, remote, { channelsRef.value }, { remoteState }) }
+                val assistant = remember { Assistant(assistantSettings, tools) }
 
                 fun load(force: Boolean) = scope.launch {
                     loading = true; error = null
@@ -69,7 +78,11 @@ class MainActivity : ComponentActivity() {
                     .filter { query.isBlank() || it.name.contains(query, true) || it.now(now)?.title?.contains(query, true) == true }
                     .sortedWith(compareBy({ numbers.get(it.id) ?: Int.MAX_VALUE }, { it.name }))
 
-                Scaffold(topBar = {
+                if (showAssistant) {
+                    AssistantScreen(assistant, assistantSettings, voice) { showAssistant = false }
+                } else Scaffold(floatingActionButton = {
+                    FloatingActionButton(onClick = { showAssistant = true }) { Icon(Icons.Default.Mic, "Assistente") }
+                }, topBar = {
                     TopAppBar(
                         title = { Text("In TV ora") },
                         actions = {
@@ -140,6 +153,7 @@ class MainActivity : ComponentActivity() {
                 if (showRemote) {
                     var ip by remember { mutableStateOf(remote.host ?: "") }
                     var test by remember { mutableStateOf("") }
+                    var extra by remember { mutableStateOf("") }
                     var busy by remember { mutableStateOf(false) }
                     var learned by remember { mutableStateOf(remote.learnedCount) }
                     AlertDialog(
@@ -163,6 +177,14 @@ class MainActivity : ComponentActivity() {
                                     ) { Text(if (remote.hasCode(d)) "$d ✓" else "$d") }
                                 }
                                 Spacer(Modifier.height(8.dp))
+                                Text("Altri tasti (per l'assistente): ${remote.learnedKeys().filter { it.length > 1 }.joinToString(", ").ifEmpty { "nessuno" }}", style = MaterialTheme.typography.bodySmall)
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    OutlinedTextField(value = extra, onValueChange = { extra = it.lowercase().filter { c -> c.isLetterOrDigit() || c == '_' }.take(20) },
+                                        label = { Text("Nome (es. volume_su)") }, singleLine = true, modifier = Modifier.weight(1f))
+                                    Button(enabled = !busy && remote.configured && extra.length > 1,
+                                        onClick = { scope.launch { busy = true; remote.learnKey(extra); busy = false } }) { Text("Impara") }
+                                }
+                                Spacer(Modifier.height(8.dp))
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                     OutlinedTextField(value = test, onValueChange = { test = it.filter(Char::isDigit).take(4) },
                                         label = { Text("Prova canale") }, singleLine = true, modifier = Modifier.weight(1f))
@@ -178,6 +200,8 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onDestroy() { voice.release(); super.onDestroy() }
 
     private fun hm(t: Long) = SimpleDateFormat("HH:mm", Locale.ITALY).format(Date(t))
 }
